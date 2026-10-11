@@ -39,7 +39,7 @@ for _cand in (_HERE, os.path.dirname(_HERE), os.getcwd()):
         sys.path.insert(0, _cand)
 
 st.set_page_config(
-    page_title="个股涨跌概率预测",
+    page_title="个股涨跌概率预测(田夫开发)",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -74,7 +74,7 @@ st.markdown("""
           background:linear-gradient(135deg,#12395e 0%,#1f5f8b 55%,#2f7fa8 100%);
           color:#fff; margin-bottom:12px; }
   .hero h1 { margin:0; font-size:24px; font-weight:700; color:#fff;
-             letter-spacing:.5px; line-height:1.3; }
+             letter-spacing:.5px; line-height:1.34; }
   .hero .code { font-size:14px; opacity:.9; font-weight:400; margin-left:6px; }
   .hero .meta { margin-top:8px; font-size:12.5px; opacity:.92; line-height:1.7; }
   .hero .tags { margin-top:9px; }
@@ -82,6 +82,18 @@ st.markdown("""
                border:1px solid rgba(255,255,255,.28); border-radius:11px;
                padding:1px 9px; font-size:11.5px; margin:2px 5px 2px 0; }
   .hero .tag.warn { background:rgba(255,193,7,.25); border-color:rgba(255,193,7,.55); }
+
+  /* 程序名称横幅：给足上下留白，避免标题贴住视口顶边被裁切 */
+  .appbanner { padding:20px 22px 18px; margin-top:2px; scroll-margin-top:80px; }
+  .appbanner h1 { font-size:25px; }
+
+  /* 个股结果卡：浅色，与深色横幅区分开 */
+  .hero.stock { background:#fff; color:#1b2b3a; border:1px solid #dde5ec;
+                border-left:5px solid #1f5f8b; }
+  .hero.stock h1 { color:#12395e; }
+  .hero.stock .meta { color:#4a5c6d; opacity:1; }
+  .hero.stock .tag { background:#eef4fa; border-color:#d3e2ef; color:#284b68; }
+  .hero.stock .tag.warn { background:#fff4d6; border-color:#f0cd7a; color:#8a5a00; }
 
   /* ---------- 表格：横向可滚动，不撑破容器 ---------- */
   div[data-testid="stDataFrame"] { max-width:100%; }
@@ -747,7 +759,7 @@ def render_header(p: dict) -> None:
                     % len(p["meta_errors"]))
 
     st.markdown(
-        "<div class='hero'>"
+        "<div class='hero stock'>"
         "<h1>%s%s</h1>"
         "<div class='meta'>数据截止 <b>%s</b>　·　现价 <b>%s</b>　·　"
         "预测周期 1天 / 5天 / 10天 / 20天 / 1个月 / 1季度 / 半年 / 1年</div>"
@@ -1462,9 +1474,15 @@ def main() -> None:
             st.code(CORE_ERROR)
         return
 
-    st.markdown("## 个股涨跌概率预测")
-    st.caption("技术面 · 基本面 · 资金面 · 情绪面 · 宏观 · 消息面 · 周期 · 金融理论 → "
-               "未来 1天/5天/10天/20天/1月/1季/半年/1年 的涨跌概率与幅度推断")
+    # 程序名称统一放进顶部渐变横幅（不再单独放一个贴顶的 ## 标题，
+    # 否则页面滚动时标题会被视口顶边裁掉一半，看起来像"显示不全"）
+    st.markdown(
+        "<div class='hero appbanner'>"
+        "<h1>个股涨跌概率预测模型V1.0 （田夫开发）</h1>"
+        "<div class='meta'>技术面 · 基本面 · 资金面 · 情绪面 · 宏观 · 消息面 · 周期 · "
+        "金融理论　→　未来 1天 / 5天 / 10天 / 20天 / 1个月 / 1个季度 / 半年 / 1年 "
+        "的涨跌概率与幅度推断</div>"
+        "</div>", unsafe_allow_html=True)
 
     sym_raw = (opts["symbol"] or "").strip()
     if not sym_raw:
