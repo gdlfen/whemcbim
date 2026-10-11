@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -26,8 +28,39 @@ _FONT_CANDIDATES = [
 _FONT_READY: bool | None = None
 
 
+def _font_has_cjk(font_name: str) -> bool:
+    """检查某个字体是否真的包含中文字形。
+
+    只检查"字体名在列表里"是不够的——Linux 上常见的情况是字体被 fontconfig
+    提供一个不带中文字形的替身，结果图里全是方框（tofu）。这里直接读字体的
+    cmap，确认它是否覆盖常用汉字区（U+4E00 起）。
+    """
+    try:
+        from matplotlib import font_manager
+
+        path = font_manager.findfont(font_manager.FontProperties(family=font_name),
+                                     fallback_to_default=False)
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            from fontTools.ttLib import TTFont  # 可选依赖
+
+            with TTFont(path, fontNumber=0, lazy=True) as ft:
+                for table in ft["cmap"].tables:
+                    if 0x4E2D in table.cmap and 0x6587 in table.cmap:  # 中文
+                        return True
+            return False
+        except Exception:  # noqa: BLE001
+            # 没有 fontTools 时退化为"文件名启发式"判断
+            low = os.path.basename(path).lower()
+            return any(k in low for k in ("cjk", "hei", "song", "ming", "yahei",
+                                          "noto", "wqy", "droidsansfallback"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def setup_chinese_font() -> bool:
-    """配置 matplotlib 中文字体；返回是否成功找到中文字体。"""
+    """配置 matplotlib 中文字体；返回是否成功找到**确实含中文字形**的字体。"""
     global _FONT_READY
     if _FONT_READY is not None:
         return _FONT_READY
@@ -38,13 +71,23 @@ def setup_chinese_font() -> bool:
         from matplotlib import font_manager
 
         available = {f.name for f in font_manager.fontManager.ttflist}
-        picked = [f for f in _FONT_CANDIDATES if f in available]
+        candidates = [f for f in _FONT_CANDIDATES if f in available]
+        # 候选表没命中时，扫描系统里所有含中文字形的字体（云端 Linux 常见）
+        if not candidates:
+            for f in font_manager.fontManager.ttflist:
+                nm = f.name or ""
+                if any(k in nm for k in ("CJK", "Noto Sans SC", "Source Han", "WenQuanYi",
+                                         "Hei", "Song", "Ming", "YaHei", "PingFang",
+                                         "Droid Sans Fallback")):
+                    candidates.append(nm)
+        picked = [c for c in dict.fromkeys(candidates) if _font_has_cjk(c)]
         if picked:
             matplotlib.rcParams["font.sans-serif"] = picked + ["DejaVu Sans"]
             matplotlib.rcParams["axes.unicode_minus"] = False
+            log.info("图表中文字体：%s", picked[0])
             _FONT_READY = True
         else:
-            log.info("未找到中文字体，图表标签将使用英文（不影响数值）")
+            log.info("未找到含中文字形的字体，图表标签改用英文（数值不受影响）")
             _FONT_READY = False
     except Exception as exc:  # noqa: BLE001
         log.debug("字体配置失败: %s", exc)

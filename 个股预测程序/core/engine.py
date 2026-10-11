@@ -21,7 +21,7 @@ import pandas as pd
 
 from . import config
 from .contracts import HORIZONS, AnalysisBundle, FactorSet, PredictionResult
-from .utils import get_logger, normalize_symbol, retry_call
+from .utils import get_logger, http_get, normalize_symbol, retry_call
 
 log = get_logger()
 
@@ -52,6 +52,153 @@ def _call(fn, *args, **kwargs):
         raise
 
 
+def lookup_code_by_name(keyword: str, limit: int = 8) -> list:
+    """用股票名称/拼音模糊查询代码。
+
+    为什么单独做这件事：``datasource.resolve_symbol`` 依赖一份 5573 行的全市场
+    代码表，冷启动要拉 18 页、在部分网络环境下会失败。而用户在手机上手输的
+    往往是"贵州茅台"这样的名称，所以这里用两个**单次请求**的联想接口兜底：
+
+    * 新浪 suggest（支持中文名，返回 ``名称,类型,代码,sh代码,名称,...``）
+    * 腾讯 smartbox（支持中文名与拼音首字母，返回 ``市场~代码~名称~拼音~类型``）
+
+    Returns
+    -------
+    list[dict]，每项 ``{"code","name","prefix","display"}``，按相关度排序；失败返回 ``[]``。
+    """
+    kw = str(keyword or "").strip()
+    if not kw:
+        return []
+    out: list[dict] = []
+    seen: set = set()
+
+    def _add(code: str, name: str, prefix: str = "") -> None:
+        code = "".join(ch for ch in str(code) if ch.isalnum())
+        if not code or code in seen:
+            return
+        # 只保留 A 股 6 位数字代码（港股/美股走另一条路）
+        if not (len(code) == 6 and code.isdigit()):
+            return
+        info = normalize_symbol((prefix + code) if prefix else code)
+        if not info.get("code"):
+            return
+        seen.add(code)
+        out.append({"code": info["code"], "name": str(name or "").strip(),
+                    "prefix": info["prefix"], "display": info["display"]})
+
+    # ---- 新浪 suggest ----
+    try:
+        from urllib.parse import quote
+
+        u = ("https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key="
+             + quote(kw, encoding="utf-8"))
+        txt = http_get(u, timeout=6.0, retries=1,
+                       headers={"Referer": "https://finance.sina.com.cn"}) or ""
+        if "=" in txt:
+            payload = txt.split("=", 1)[1].strip().strip('";')
+            for item in payload.split(";"):
+                parts = item.split(",")
+                if len(parts) >= 4 and parts[2].strip().isdigit():
+                    _add(parts[2], parts[0], "sh" if parts[3].startswith("sh") else "sz")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("新浪 suggest 查询失败: %s", exc)
+
+    # ---- 腾讯 smartbox（中文名与拼音首字母都支持）----
+    if len(out) < limit:
+        try:
+            from urllib.parse import quote
+
+            u = "https://smartbox.gtimg.cn/s3/?v=2&q=%s&t=all" % quote(kw, encoding="utf-8")
+            raw = http_get(u, timeout=6.0, retries=1) or ""
+            body = raw
+            if "\\u" in body:                     # 解 unicode 转义
+                body = body.encode("latin-1", "ignore").decode("unicode_escape", "ignore")
+            if '"' in body:
+                body = body.split('"', 1)[1].rsplit('"', 1)[0]
+            for item in body.split("^"):
+                parts = item.split("~")
+                if len(parts) >= 4 and parts[1].strip().isdigit():
+                    _add(parts[1], parts[2], parts[0].strip().lower())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("腾讯 smartbox 查询失败: %s", exc)
+
+    return out[:limit]
+
+
+def fetch_stock_news(symbol_info: dict, name: str = "", limit: int = 20) -> list:
+    """抓取**只与这只股票相关**的新闻（东财个股新闻列表接口，按股票代码过滤）。
+
+    为什么要单独做：把"全市场搜索"的结果当个股新闻用，会出现分析海天味业却
+    推送"半导体板块""某公司收购"这种完全无关的内容。这里改用按代码过滤的
+    列表接口，并对标题做一次相关性复核。
+
+    Returns
+    -------
+    list[dict]，每项 ``{"title","date","source","url","tag","direction","detail"}``；
+    失败或全部不相关时返回 ``[]``。
+    """
+    info = symbol_info or {}
+    code = str(info.get("code") or "").strip()
+    if not code or not info.get("is_cn", True):
+        return []
+    mtype = "1" if info.get("prefix") == "sh" else "0"
+    out: list[dict] = []
+    try:
+        import json as _json
+
+        u = ("https://np-listapi.eastmoney.com/comm/web/getListInfo?client=web&biz=web_news"
+             "&mTypeAndCode=%s.%s&pageSize=%d&pageIndex=1&type=1" % (mtype, code, max(limit, 10)))
+        raw = http_get(u, timeout=10, retries=2,
+                       headers={"Referer": "https://so.eastmoney.com/"})
+        j = _json.loads(raw)
+        items = ((j.get("data") or {}).get("list")) or []
+    except Exception as exc:  # noqa: BLE001
+        log.debug("个股新闻列表取数失败: %s", exc)
+        return []
+
+    kw = str(name or "").strip()
+    for it in items:
+        title = str(it.get("Art_Title") or "").strip()
+        if not title:
+            continue
+        # 相关性复核：标题须含股票名称或代码；否则丢弃（宁可少，不可错）
+        if kw and kw not in title and code not in title:
+            continue
+        art_code = str(it.get("Art_Code") or "")
+        out.append({
+            "title": title,
+            "date": str(it.get("Art_ShowTime") or "")[:19],
+            "source": str(it.get("Art_MediaName") or it.get("Np_dst") or "东方财富"),
+            "url": ("https://finance.eastmoney.com/a/%s.html" % art_code) if art_code else "",
+            "summary": str(it.get("Art_Summary") or "")[:200],
+            "tag": "", "direction": 0, "detail": "",
+        })
+        if len(out) >= limit:
+            break
+    if out:
+        log.info("个股新闻：从东财个股列表取得 %d 条与「%s」直接相关的新闻",
+                 len(out), kw or code)
+    return out
+
+
+def _is_relevant(item, code: str, name: str) -> bool:
+    """判断一条资讯是否与目标个股直接相关（标题含名称/代码）。"""
+    if not isinstance(item, dict):
+        return False
+    title = str(item.get("title") or "")
+    if not title:
+        return False
+    if name and name in title:
+        return True
+    if code and code in title:
+        return True
+    # 名称的简称匹配（如"海天味业"→"海天"），但要求长度≥2 且不是常见泛词
+    short = str(name or "").strip()[:2]
+    generic = {"中国", "华夏", "东方", "南方", "北方", "新能", "科技", "股份", "集团",
+               "控股", "国际", "银行", "证券", "医药", "地产", "能源", "电力", "汽车"}
+    return bool(len(short) >= 2 and short not in generic and short in title)
+
+
 class Predictor:
     """一只股票的完整预测流程。
 
@@ -67,10 +214,33 @@ class Predictor:
     def __init__(self, symbol: str, name: str = "", *, days: int | None = None,
                  use_ml: bool = True, demo: bool = False, offline: bool = False,
                  horizons=HORIZONS, verbose: bool = True):
-        self.query = symbol
-        self.symbol_info = normalize_symbol(symbol)
+        self.query = str(symbol or "").strip()
+        self.symbol_info = normalize_symbol(self.query)
         self.code = self.symbol_info["code"]
         self.name = name
+        # 用户可能直接输入中文名/拼音（手机上手输很常见）。此时
+        # normalize_symbol 得不到代码，用联想接口解析一次（单次请求，很快）。
+        if not self.code and self.query:
+            if not self.name and not self.query.isascii():
+                self.name = self.query          # 至少把'海天味业'显示出来
+            try:
+                hits = lookup_code_by_name(self.query)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("名称解析失败: %s", exc)
+                hits = []
+            if hits:
+                best = hits[0]
+                self.symbol_info = normalize_symbol(best["prefix"] + best["code"])
+                self.code = self.symbol_info["code"]
+                if not self.name and best.get("name"):
+                    self.name = best["name"]
+                self.name_hits = hits
+                log.info("按名称「%s」解析到 %s（%s）", self.query, self.code,
+                         self.name or best.get("name", ""))
+        if not self.code and self.query:
+            self.symbol_info["display"] = self.query
+            if not self.symbol_info.get("name"):
+                self.symbol_info["name"] = self.query
         self.days = days or config.RUNTIME["history_days"]
         self.use_ml = use_ml
         self.demo = demo
@@ -135,13 +305,20 @@ class Predictor:
         bundle.ohlcv = daily
         if self.name:
             bundle.name = self.name
-        # 缓存交互时，代码名可能来自数据源
-        try:
-            if ds is not None and not self.name:
-                info = ds.resolve_symbol(self.code)
-                bundle.name = info.get("name") or bundle.name or self.code
-        except Exception:  # noqa: BLE001
-            bundle.name = bundle.name or self.code
+        # 名称解析：优先用 K 线接口附带的名称（腾讯/新浪都会带），
+        # 其次查代码表；两者都拿不到时先留空，等实时快照拿到后再定（见下）。
+        if not bundle.name:
+            attrs_name = (getattr(daily, "attrs", {}) or {}).get("name")
+            if attrs_name:
+                bundle.name = str(attrs_name).strip()
+        if not bundle.name and ds is not None:
+            try:
+                info = ds.resolve_symbol(self.code) or {}
+                nm = info.get("name")
+                if nm and str(nm).strip() != self.code:
+                    bundle.name = str(nm).strip()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("resolve_symbol 失败: %s", exc)
 
         if bundle.kline_weekly is None and daily is not None and len(daily) > 30:
             try:
@@ -162,6 +339,19 @@ class Predictor:
             last = daily.iloc[-1]
             snap = {"price": float(last["close"]), "source": "kline_fallback",
                     "prev_close": float(daily["close"].iloc[-2]) if len(daily) > 1 else None}
+        # 股票名称按可靠度依次回退：用户传入 > 实时快照 > 日线接口附带 > 代码表 > 代码本身。
+        # 注意：代码表查询（resolve_symbol）在未缓存时可能返回 None，
+        # 绝不能让它覆盖已经拿到的真实名称。
+        name_candidates = [
+            self.name,
+            snap.get("name"),
+            (getattr(daily, "attrs", {}) or {}).get("name") if daily is not None else None,
+            bundle.name,
+        ]
+        resolved = next((str(x).strip() for x in name_candidates
+                         if x and str(x).strip() and str(x).strip() != self.code), "")
+        bundle.name = resolved or bundle.name or self.code
+        snap["name"] = bundle.name
         bundle.snapshot = {**snap, "symbol": self.code, "name": bundle.name}
 
         # 大盘指数
@@ -298,11 +488,12 @@ class Predictor:
         m = _mod("capital")
         if m is None:
             return
-        flow = holders = margin = lhb = north = None
+        flow = holders = margin = lhb = north = top10 = None
         if not self.demo:
             for attr, fname in (("flow", "fetch_fund_flow"), ("holders", "fetch_holders"),
                                 ("margin", "fetch_margin"), ("lhb", "fetch_lhb"),
-                                ("north", "fetch_northbound")):
+                                ("north", "fetch_northbound"),
+                                ("top10", "fetch_top10_float_holders")):
                 f = getattr(m, fname, None)
                 if f is None:
                     continue
@@ -316,16 +507,18 @@ class Predictor:
                     margin = val
                 elif attr == "lhb":
                     lhb = val
+                elif attr == "top10":
+                    top10 = val
                 else:
                     north = val
         bundle.capital = {"flow": flow, "holders": holders, "margin": margin,
-                          "lhb": lhb, "north": north,
+                          "lhb": lhb, "north": north, "top10": top10,
                           "minute_flow": (retry_call(lambda: m.fetch_minute_flow(self.code),
                                                      attempts=1, default={}, label="minute")
                                           if hasattr(m, "fetch_minute_flow") and not self.demo else {})}
         if hasattr(m, "capital_factors"):
             out = _call(m.capital_factors, self.code, flow=flow, holders=holders,
-                        margin=margin, lhb=lhb, north=north,
+                        margin=margin, lhb=lhb, north=north, top10=top10,
                         snapshot=bundle.snapshot, frame=bundle.ohlcv)
             self._absorb(bundle, out, "capital", "capital")
         if hasattr(m, "control_degree"):
@@ -401,26 +594,44 @@ class Predictor:
     # -- 消息面 --------------------------------------------------------- #
     def _news(self, bundle: AnalysisBundle) -> None:
         m = _mod("newsflow")
-        if m is None:
-            return
         news, anns = [], []
+        # ① 个股专属新闻（按代码过滤，相关性最高）——放在最优先
         if not self.demo:
-            f = getattr(m, "fetch_news", None)
-            if f is not None:
-                news = retry_call(lambda: f(self.code, bundle.name), attempts=2,
-                                  delay=0.5, default=[], label="news") or []
+            news = retry_call(lambda: fetch_stock_news(self.symbol_info, bundle.name, 20),
+                              attempts=2, delay=0.5, default=[], label="stock_news") or []
+            if news and m is not None and hasattr(m, "classify_news"):
+                try:
+                    news = m.classify_news(news)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("个股新闻分类失败: %s", exc)
+        if m is None:
+            bundle.news = list(news) + list(anns)
+            return
+        # ② 公告（按代码查询，官方来源，同样高度相关）
+        if not self.demo:
             f = getattr(m, "fetch_announcements", None)
             if f is not None:
                 anns = retry_call(lambda: f(self.code), attempts=2, delay=0.5,
                                   default=[], label="anns") or []
-        if news and hasattr(m, "classify_news"):
-            try:
-                news = m.classify_news(news)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("新闻分类失败: %s", exc)
-        bundle.news = list(news) + list(anns)
+        # ③ 补充搜索类新闻：只有在"标题与个股相关"时才采纳
+        extra = []
+        if not self.demo and len(news) < 5:
+            f = getattr(m, "fetch_news", None)
+            if f is not None:
+                cand = retry_call(lambda: f(self.code, bundle.name), attempts=1,
+                                  delay=0.4, default=[], label="news") or []
+                extra = [x for x in cand if _is_relevant(x, self.code, bundle.name)]
+                if len(cand) and not extra:
+                    bundle.note("已过滤掉 %d 条与「%s」无直接关系的搜索类资讯"
+                                % (len(cand), bundle.name or self.code))
+                if extra and hasattr(m, "classify_news"):
+                    try:
+                        extra = m.classify_news(extra)
+                    except Exception:  # noqa: BLE001
+                        pass
+        bundle.news = list(news) + list(anns) + list(extra)
         if hasattr(m, "event_factors"):
-            out = _call(m.event_factors, self.code, news=news, announcements=anns,
+            out = _call(m.event_factors, self.code, news=bundle.news, announcements=anns,
                         name=bundle.name)
             self._absorb(bundle, out, "news", "newsflow")
 
@@ -502,6 +713,12 @@ class Predictor:
         progress : callable | None
             形如 ``progress(stage_name, pct)`` 的回调，供 Streamlit 显示进度。
         """
+        if not self.code:
+            raise ValueError(
+                "无法识别股票代码「%s」。请输入 6 位 A 股代码（如 600519、000001、300750）"
+                "或带市场前缀的写法（sh600519、000001.SZ、00700.HK、AAPL）。"
+                % (self.query or "（空）"))
+
         def _p(stage: str, pct: float):
             if progress:
                 try:
