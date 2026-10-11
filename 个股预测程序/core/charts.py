@@ -59,8 +59,34 @@ def _font_has_cjk(font_name: str) -> bool:
         return False
 
 
+#: 随仓库分发的字体（子集化，0.27MB，含 ASCII + 源码里出现的全部汉字/符号）。
+#: 云端 Linux 常常"看起来装了中文字体、实际渲染成方框"，所以自带一份最可靠。
+_BUNDLED_FONT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets",
+                             "NotoSansSC-subset.otf")
+
+
+def register_bundled_font() -> str | None:
+    """把随仓库分发的字体注册进 matplotlib，返回其字体名（失败返回 None）。"""
+    try:
+        if not os.path.exists(_BUNDLED_FONT):
+            return None
+        from matplotlib import font_manager
+
+        font_manager.fontManager.addfont(_BUNDLED_FONT)
+        name = font_manager.FontProperties(fname=_BUNDLED_FONT).get_name()
+        return name or None
+    except Exception as exc:  # noqa: BLE001
+        log.debug("注册内置字体失败: %s", exc)
+        return None
+
+
 def setup_chinese_font() -> bool:
-    """配置 matplotlib 中文字体；返回是否成功找到**确实含中文字形**的字体。"""
+    """配置 matplotlib 中文字体；返回是否成功找到**确实含中文字形**的字体。
+
+    优先级：**随仓库分发的子集字体** > 系统里经验证含汉字的字体 > 英文回退。
+    每个候选字体都会读 cmap 校验；都不行时返回 False（调用方改用英文标签），
+    避免在图上画出一堆方框。
+    """
     global _FONT_READY
     if _FONT_READY is not None:
         return _FONT_READY
@@ -70,9 +96,13 @@ def setup_chinese_font() -> bool:
         matplotlib.use("Agg", force=False)
         from matplotlib import font_manager
 
+        picked: list[str] = []
+        bundled = register_bundled_font()
+        if bundled and _font_has_cjk(bundled):
+            picked.append(bundled)
+
         available = {f.name for f in font_manager.fontManager.ttflist}
         candidates = [f for f in _FONT_CANDIDATES if f in available]
-        # 候选表没命中时，扫描系统里所有含中文字形的字体（云端 Linux 常见）
         if not candidates:
             for f in font_manager.fontManager.ttflist:
                 nm = f.name or ""
@@ -80,8 +110,12 @@ def setup_chinese_font() -> bool:
                                          "Hei", "Song", "Ming", "YaHei", "PingFang",
                                          "Droid Sans Fallback")):
                     candidates.append(nm)
-        picked = [c for c in dict.fromkeys(candidates) if _font_has_cjk(c)]
+        for c in dict.fromkeys(candidates):
+            if c not in picked and _font_has_cjk(c):
+                picked.append(c)
+
         if picked:
+            # DejaVu Sans 兜底：内置子集字体已含 ASCII，但再加一层保险
             matplotlib.rcParams["font.sans-serif"] = picked + ["DejaVu Sans"]
             matplotlib.rcParams["axes.unicode_minus"] = False
             log.info("图表中文字体：%s", picked[0])

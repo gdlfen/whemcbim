@@ -1,3 +1,6 @@
-# Streamlit Cloud 的系统级依赖（apt 包）
-# 中文字体：否则图表中的中文会显示成方框
+# Streamlit Cloud 系统级依赖（apt 包）
+# 注意：本文件必须是纯 ASCII/UTF-8 无 BOM，否则 apt 包名会被 BOM 污染而安装失败。
+#
+# 图表中文字体已随仓库分发（core/assets/NotoSansSC-subset.otf，0.26MB，
+# 由 core/charts.py 在启动时注册给 matplotlib），因此这一项只是额外保险。
 fonts-noto-cjk

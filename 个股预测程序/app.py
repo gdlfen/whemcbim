@@ -251,6 +251,32 @@ _FIELD_LABELS = {
     "breadth_source": None, "vix_source": None, "code": None, "symbol": None,
     "id": None, "as_of": None, "fetched_at": None, "kind": None,
     # —— 通用 ——
+    # —— 资金流向表的列（模块内部用英文列名）——
+    "date": "日期", "close": "收盘价", "pct_chg": "涨跌幅%",
+    "main_net": "主力净流入", "small_net": "小单净流入", "mid_net": "中单净流入",
+    "big_net": "大单净流入", "super_net": "超大单净流入",
+    "main_pct": "主力净占比%", "big_pct": "大单净占比%",
+    "super_pct": "超大单净占比%", "small_pct": "小单净占比%",
+    "mid_pct": "中单净占比%", "main_net_5d": "5日主力净额",
+    "main_net_10d": "10日主力净额", "main_net_20d": "20日主力净额",
+    "net_amount": "净流入额", "netamount": "净流入额", "opendate": "日期",
+    "trade": "收盘价", "changeratio": "涨跌幅", "turnover": "换手率%",
+    "r0_net": "超大单净额", "r1_net": "大单净额", "r2_net": "中单净额",
+    "r3_net": "小单净额", "r0": "超大单买入", "r1": "大单买入",
+    "r2": "中单买入", "r3": "小单买入", "ratioamount": "净占比",
+    # —— 其他常见列 ——
+    "ROE": "净资产收益率%", "EPS": "每股收益", "BPS": "每股净资产",
+    "indices": "指数", "boards": "所属板块", "boards_hot": "涨停板块分布",
+    "margin": "两融数据", "matched": "命中关键词", "alias": "别名",
+    "missing": "缺数字段", "n_titles": "分析资讯条数",
+    "earnings": "财报窗口", "fib_window": "斐波那契时间窗",
+    "gann_cycle": "江恩时间周期", "consensus": "理论综合", "today": "当日",
+    "swing_points": "摆动点", "targets": "目标位", "gann_angles": "江恩角度线",
+    "gann_fan": "江恩扇形线", "square_of_9": "江恩四方形",
+    "time_cycles": "时间周期", "seasonal_date": "节气变盘日",
+    "retracement": "回撤位", "extension": "扩展位", "time_windows": "时间窗口",
+    "ma": "均线", "index_close": "指数收盘", "index_pct_avg": "指数平均涨幅%",
+    "broken_rate": "炸板率", "vix": "VIX恐慌指数",
     "stage": "所处阶段", "stage_detail": "阶段说明", "detail": "说明",
     "trend": "趋势", "trend_type": "趋势类型", "trend_r2": "趋势拟合优度R²",
     "trend_score": "趋势分", "direction": "方向", "score": "评分",
@@ -350,6 +376,53 @@ def _label(k: str) -> str | None:
     return str(k)
 
 
+def _df_zh(df: pd.DataFrame, *, drop_internal: bool = True) -> pd.DataFrame:
+    """把 DataFrame 的英文列名批量译成中文，并丢弃内部技术列。
+
+    模块内部统一用英文/下划线列名（便于程序处理），但展示给用户时必须是中文。
+    这里在渲染前统一改名，避免每处表格单独维护。
+
+    注意：源表**可能自带重复列名**（多个模块都可能输出 ``source`` 之类），
+    所以先按位置挑选并展平重复列，再改名，最后确保结果没有重名列——
+    否则 pandas 的 Arrow 后端会因重复列陷入递归。
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    picked: list = []          # [(列位置, 原列名)]
+    seen: set = set()
+    for i, c in enumerate(df.columns):
+        key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _label(key) is None and drop_internal:
+            continue
+        picked.append((i, key))
+    if not picked:
+        return df
+    sub = df.iloc[:, [i for i, _ in picked]].copy()
+    names, used = [], set()
+    for _, key in picked:
+        lab = _label(key) or key
+        base, n = lab, 2
+        while lab in used:
+            lab = "%s(%d)" % (base, n)
+            n += 1
+        used.add(lab)
+        names.append(lab)
+    sub.columns = names
+    return sub
+
+
+def _show_df(df: pd.DataFrame) -> None:
+    """统一的数据表渲染：先中文化列名，再交给 st.dataframe。"""
+    d = _df_zh(df)
+    if d is None or (hasattr(d, "empty") and getattr(d, "empty", False)):
+        st.caption("（本次未取得该项数据）")
+        return
+    st.dataframe(d, width="stretch", hide_index=True)
+
+
 def _cat_factors(p: dict, category: str) -> list:
     """取某一类别的**全量**因子（优先用 factors_all，退回 forecast 里的 top8）。"""
     rows = [d for d in (p.get("factors_all") or []) if d.get("类别") == category]
@@ -373,7 +446,7 @@ def _factor_block(p: dict, category: str, *, title: str = "") -> None:
         "解读": str(d.get("解读"))[:150],
         "理论依据": d.get("理论依据"),
     } for d in rows])
-    st.dataframe(df, width="stretch", hide_index=True)
+    _show_df(df)
     st.caption("共 %d 条因子（按强度×可信度排序）。" % len(rows))
 
 
@@ -774,10 +847,10 @@ def render_forecast_table(p: dict) -> None:
     # 用容器查询不支持，改用列数判断：≥12 列时优先给完整表（可横向滚动），
     # 同时始终提供核心表，手机用户默认看到核心表。
     st.markdown("**核心结论**")
-    st.dataframe(pd.DataFrame(core_rows), width="stretch", hide_index=True)
+    _show_df(pd.DataFrame(core_rows))
     with st.expander("查看完整数据（区间 / 大涨大跌概率 / 波动率 / AI参与度）",
                      expanded=False):
-        st.dataframe(pd.DataFrame(full_rows), width="stretch", hide_index=True)
+        _show_df(pd.DataFrame(full_rows))
     st.caption("说明：**大涨/大跌概率**按各周期阈值计算（1天 ±3%、20天 ±12%、1年 ±50%）；"
                "**置信度**已根据历史回测结果自动折扣。表格可左右滑动查看全部列。")
 
@@ -846,7 +919,7 @@ def render_drivers(p: dict) -> None:
                          "贡献%": d.get("贡献"), "解读": d.get("解读"),
                          "理论依据": d.get("理论依据"), "观测值": str(d.get("观测值"))[:40]})
         if rows:
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            _show_df(pd.DataFrame(rows))
 
 
 def _esc(x) -> str:
@@ -949,7 +1022,7 @@ def render_dimensions(p: dict) -> None:
         fin = p.get("financials_tail")
         if fin and any(len(v) for v in fin.values()):
             st.markdown("**财务摘要（最近若干期）**")
-            st.dataframe(pd.DataFrame(fin), width="stretch", hide_index=True)
+            _show_df(pd.DataFrame(fin))
             st.caption("报告期口径：A 股财报为**年内累计**，"
                        "单季/环比列已由财务模块拆分计算。")
         else:
@@ -986,7 +1059,7 @@ def render_dimensions(p: dict) -> None:
             v = cap.get(key)
             if v:
                 st.markdown("**%s**" % label)
-                st.dataframe(pd.DataFrame(v), width="stretch", hide_index=True)
+                _show_df(pd.DataFrame(v))
             else:
                 st.caption("（%s：本次未取到数据）" % label)
         _factor_block(p, "资金面/主力", title="该维度生成的因子")
@@ -1010,8 +1083,7 @@ def render_dimensions(p: dict) -> None:
                     for kk, vv in v.items():
                         if isinstance(vv, list) and vv and isinstance(vv[0], dict):
                             st.caption("· %s" % kk)
-                            st.dataframe(pd.DataFrame(vv[:15]), width="stretch",
-                                         hide_index=True)
+                            _show_df(pd.DataFrame(vv[:15]))
                 elif isinstance(v, (str, int, float, bool)) and v is not None:
                     st.write("%s：%s" % (k, v))
         else:
@@ -1019,7 +1091,7 @@ def render_dimensions(p: dict) -> None:
         boards = p.get("sector_boards") or []
         if boards:
             st.markdown("**该股所属板块（均与个股直接相关）**")
-            st.dataframe(pd.DataFrame(boards), width="stretch", hide_index=True)
+            _show_df(pd.DataFrame(boards))
         _factor_block(p, "情绪/博弈", title="该维度生成的因子")
 
     with tab6:
@@ -1037,8 +1109,7 @@ def render_dimensions(p: dict) -> None:
                               if not isinstance(vv, (dict, list))})
                     for kk, vv in v.items():
                         if isinstance(vv, list) and vv and isinstance(vv[0], dict):
-                            st.dataframe(pd.DataFrame(vv[:12]), width="stretch",
-                                         hide_index=True)
+                            _show_df(pd.DataFrame(vv[:12]))
         else:
             st.warning("未取得宏观数据（依赖 akshare 宏观接口，受限时用配置默认值兜底）。")
         _factor_block(p, "宏观/行业", title="该维度生成的因子")
@@ -1059,7 +1130,7 @@ def render_dimensions(p: dict) -> None:
                              "倾向": "利好" if d and d > 0 else ("利空" if d and d < 0 else "中性"),
                              "相关": "是" if related else "否",
                              "来源": n.get("source", "")})
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            _show_df(pd.DataFrame(rows))
             st.caption("共 %d 条。标注「相关」表示标题中直接出现该股名称或代码；"
                        "标注为「是」的是与个股直接相关的资讯/公告。" % len(rows))
         else:
@@ -1088,8 +1159,7 @@ def render_dimensions(p: dict) -> None:
                               if not isinstance(vv, (dict, list))})
                     for kk, vv in v.items():
                         if isinstance(vv, list) and vv and isinstance(vv[0], dict):
-                            st.dataframe(pd.DataFrame(vv[:10]), width="stretch",
-                                         hide_index=True)
+                            _show_df(pd.DataFrame(vv[:10]))
         else:
             st.info("未取得季节性数据。")
         _factor_block(p, "周期/季节", title="该维度生成的因子")
@@ -1123,8 +1193,7 @@ def render_dimensions(p: dict) -> None:
                     for kk, vv in v.items():
                         if isinstance(vv, list) and vv and isinstance(vv[0], dict):
                             st.caption("· %s" % kk)
-                            st.dataframe(pd.DataFrame(vv[:12]), width="stretch",
-                                         hide_index=True)
+                            _show_df(pd.DataFrame(vv[:12]))
                 elif isinstance(v, (str, int, float, bool)) and v is not None:
                     st.write("%s：%s" % (field_label.get(k, k), v))
         else:
@@ -1137,7 +1206,7 @@ def render_dimensions(p: dict) -> None:
         rows = [{"类别": k, "看涨": v.get("看涨", 0), "看跌": v.get("看跌", 0),
                  "中性": v.get("中性", 0), "合计": sum(v.values())}
                 for k, v in stats["by_category"].items()]
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        _show_df(pd.DataFrame(rows))
 
 
 def _all_factors(p: dict) -> list:
@@ -1258,7 +1327,7 @@ def render_backtest(p: dict, do_backtest: bool, symbol: str, days: int, demo: bo
             st.caption(grade.get("detail", ""))
             if not tbl.empty:
                 st.markdown("<div class='scrollx'>", unsafe_allow_html=True)
-                st.dataframe(tbl, width="stretch", hide_index=True)
+                _show_df(tbl)
                 st.markdown("</div>", unsafe_allow_html=True)
             fig = charts_mod.plot_backtest(tbl, grade)
             if fig is not None:
