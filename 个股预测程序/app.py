@@ -39,12 +39,12 @@ for _cand in (_HERE, os.path.dirname(_HERE), os.getcwd()):
         sys.path.insert(0, _cand)
 
 st.set_page_config(
-    page_title="个股涨跌概率预测(田夫开发)",
+    page_title="个股涨跌概率预测",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={"about": "基于技术面/基本面/资金面/情绪面/宏观/消息面/周期/理论模型的多周期概率预测。"
-                         "仅供研究，不构成投资建议。"},
+                         "田夫 开发。仅供研究，不构成投资建议。"},
 )
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +86,9 @@ st.markdown("""
   /* 程序名称横幅：给足上下留白，避免标题贴住视口顶边被裁切 */
   .appbanner { padding:20px 22px 18px; margin-top:2px; scroll-margin-top:80px; }
   .appbanner h1 { font-size:25px; }
+  /* 开发者署名：比正文再小 2 号（11px → 9px），弱化显示 */
+  .appbanner .byline { margin-top:9px; font-size:9px; opacity:.62; letter-spacing:.3px;
+                       line-height:1.5; }
 
   /* 个股结果卡：浅色，与深色横幅区分开 */
   .hero.stock { background:#fff; color:#1b2b3a; border:1px solid #dde5ec;
@@ -213,6 +216,14 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int) -> dict:
         "theory": _deep_clean(getattr(bundle, "theory", {}) or {}, depth=2),
         "financials_tail": _frame_tail(getattr(bundle, "financials", None), 8),
         "sector_boards": (getattr(bundle, "sentiment", {}) or {}).get("boards_raw") or [],
+        # ---- 大盘与外围市场（A股/港股/美股/VIX/A50）----
+        "market_global": _clean_global_market(getattr(bundle, "market", {}) or {}),
+        # ---- 主力操盘意图 ----
+        "main_intent": _clean_dict((getattr(bundle, "capital", {}) or {}).get("main_intent")
+                                   or {}, depth=2),
+        "intent_series": [x for x in
+                          ((getattr(bundle, "capital", {}) or {}).get("intent_series") or [])
+                          if isinstance(x, dict)][-30:],
         "stages": stages[-6:],
     }
     # 图表所需的最小行情数据（只留最近 320 根，控制缓存体积）
@@ -289,7 +300,55 @@ _FIELD_LABELS = {
     "retracement": "回撤位", "extension": "扩展位", "time_windows": "时间窗口",
     "ma": "均线", "index_close": "指数收盘", "index_pct_avg": "指数平均涨幅%",
     "broken_rate": "炸板率", "vix": "VIX恐慌指数",
-    "stage": "所处阶段", "stage_detail": "阶段说明", "detail": "说明",
+    # —— 理论模型里残留的英文键 ——
+    "daily": "日线", "weekly": "周线", "monthly": "月线",
+    "origin": "扇形原点", "lines": "角度线组",
+    "time_stage": "时间窗状态", "patterns": "量价组合", "volume_confirm": "量能验证",
+    "high": "区间高点", "low": "区间低点", "targets": "目标位",
+    "nearest_level_role": "档位角色", "sing_points": "摆动点", "swing_points": "摆动点",
+    "pageant": "形态", "phase": "所处阶段", "wave": "浪级",
+    "primary_trend": "主要趋势", "secondary_trend": "次级趋势",
+    "gann_angles": "江恩角度线", "gann_fan": "江恩扇形线",
+    "square_of_9": "江恩四方形", "time_cycles": "时间周期",
+    "seasonal_date": "节气变盘日", "fib_conformance": "波浪吻合度",
+    "hh_hl": "高点抬高+低点抬高", "lh_ll": "高点降低+低点降低",
+    "volume_stage": "量能阶段", "price_stage": "价格阶段",
+    "current_line": "当前角度线", "position": "位置", "score": "评分",
+    "market_state": "市场状态", "sensitivity": "敏感性",
+    "lyapunov_est": "李雅普诺夫指数", "hurst": "Hurst指数",
+    "fractal_dimension": "分形维数", "resonance": "是否共振",
+    "resonance_direction": "共振方向", "strength": "强度",
+    "bull_count": "看涨模型数", "bear_count": "看跌模型数",
+    "detail": "说明", "confidence": "置信度", "direction": "方向",
+    # —— 消息/情绪/板块里残留的英文键 ——
+    "theme_names": "命中题材", "is_hot_theme": "是否处于风口",
+    "sector_rank_pct": "板块强度分位", "leader_stock": "板块龙头",
+    "hottest": "最热板块", "limit_up_count": "涨停家数",
+    "limit_down_count": "跌停家数", "max_continuous": "最高连板",
+    "continuous_count": "连板家数", "limit_up_date": "统计日期",
+    "n_titles": "分析资讯条数", "matched": "命中关键词",
+    "alias": "别名", "missing": "未取到的字段",
+    # —— 商品价格 ——
+    "price": "最新价", "prev_close": "昨收", "open": "开盘",
+    "high_price": "最高", "low_price": "最低", "pct_chg": "涨跌幅%",
+    # —— 资金流向表的列（模块内部用英文列名）——
+    "date": "日期", "close": "收盘价",
+    "main_net": "主力净流入", "small_net": "小单净流入", "mid_net": "中单净流入",
+    "big_net": "大单净流入", "super_net": "超大单净流入",
+    "main_pct": "主力净占比%", "big_pct": "大单净占比%",
+    "super_pct": "超大单净占比%", "small_pct": "小单净占比%",
+    "mid_pct": "中单净占比%", "main_net_5d": "5日主力净额",
+    "main_net_10d": "10日主力净额", "main_net_20d": "20日主力净额",
+    "net_amount": "净流入额", "netamount": "净流入额", "opendate": "日期",
+    "trade": "收盘价", "changeratio": "涨跌幅",
+    "r0_net": "超大单净额", "r1_net": "大单净额", "r2_net": "中单净额",
+    "r3_net": "小单净额", "r0": "超大单买入", "r1": "大单买入",
+    "r2": "中单买入", "r3": "小单买入", "ratioamount": "净占比",
+    # —— 其他常见列 ——
+    "ROE": "净资产收益率%", "EPS": "每股收益", "BPS": "每股净资产",
+    "indices": "指数", "boards": "所属板块", "boards_hot": "涨停板块分布",
+    "margin": "两融数据", "earnings": "财报窗口", "fib_window": "斐波那契时间窗",
+    "gann_cycle": "江恩时间周期", "consensus": "理论综合", "today": "当日",
     "trend": "趋势", "trend_type": "趋势类型", "trend_r2": "趋势拟合优度R²",
     "trend_score": "趋势分", "direction": "方向", "score": "评分",
     "confidence": "置信度", "strength": "强度", "reliability": "可信度",
@@ -460,6 +519,40 @@ def _factor_block(p: dict, category: str, *, title: str = "") -> None:
     } for d in rows])
     _show_df(df)
     st.caption("共 %d 条因子（按强度×可信度排序）。" % len(rows))
+
+
+def _clean_global_market(mk: dict) -> dict:
+    """整理大盘/外围市场数据供前端展示（去掉冗余的K线对象）。"""
+    if not isinstance(mk, dict):
+        return {}
+    snap = mk.get("snapshot") or {}
+    rows = []
+    for k, v in snap.items():
+        if isinstance(v, dict):
+            rows.append({
+                "code": k, "name": v.get("name") or k,
+                "group": v.get("group") or "",
+                "price": v.get("price"), "pct_chg": v.get("pct_chg"),
+                "last_date": v.get("last_date") or "",
+            })
+    lk = mk.get("linkage") or {}
+    links = []
+    for k, v in lk.items():
+        if isinstance(v, dict):
+            links.append({
+                "code": k, "name": v.get("name") or k,
+                "group": v.get("group") or "",
+                "same_day_corr": v.get("same_day_corr"),
+                "lead_corr": v.get("lead_corr"),
+                "recent_5d_pct": v.get("recent_5d_pct"),
+                "recent_20d_pct": v.get("recent_20d_pct"),
+                "n": v.get("n"),
+            })
+    # 按领先相关性绝对值排序，最相关的排前面
+    links.sort(key=lambda x: -abs(x.get("lead_corr") or 0))
+    return {"snapshot": rows, "linkage": links,
+            "relative": mk.get("relative") or {},
+            "detail": mk.get("detail") or ""}
 
 
 def _clean_dict(d: dict, depth: int = 1) -> dict:
@@ -653,15 +746,28 @@ POPULAR = ["600519 贵州茅台", "000001 平安银行", "300750 宁德时代", 
            "601899 紫金矿业", "002415 海康威视", "300059 东方财富", "601012 隆基绿能"]
 
 
+def _apply_symbol(code: str) -> None:
+    """按钮/单选框的回调：把选中的代码写入输入框并触发分析。
+
+    必须在 **回调** 里写 ``st.session_state["symbol_input"]``——
+    Streamlit 不允许在部件实例化之后修改它的 session_state 键，
+    这也是之前手机端"代码解析失败：
+    st.session_state.symbol_input cannot be modified after the widget ..." 的原因。
+    """
+    st.session_state["symbol_input"] = code
+    st.session_state["run_analysis"] = True
+    st.session_state.pop("name_pick", None)
+
+
 def sidebar() -> dict:
     st.sidebar.title("个股涨跌概率预测")
     st.sidebar.caption("core v%s ｜ 8 个周期 ｜ 8 大维度因子" % CORE_VERSION)
 
-    if "symbol_input" not in st.session_state:
-        st.session_state["symbol_input"] = "600519"
+    st.session_state.setdefault("symbol_input", "600519")
 
     symbol = st.sidebar.text_input("股票代码 / 名称", key="symbol_input",
-                                   help="支持 600519、sh600519、000001.SZ、00700.HK、AAPL")
+                                   help="支持 600519、sh600519、000001.SZ、00700.HK、AAPL，"
+                                        "也可直接输入中文名或拼音（如 贵州茅台 / maotai）")
     if st.sidebar.button("开始分析", type="primary", width="stretch"):
         st.session_state["run_analysis"] = True
         cached_analysis.clear()
@@ -670,10 +776,8 @@ def sidebar() -> dict:
         cols = st.columns(2)
         for i, item in enumerate(POPULAR):
             code = item.split()[0]
-            if cols[i % 2].button(code, key="pop_%s" % code, width="stretch"):
-                st.session_state["symbol_input"] = code
-                st.session_state["run_analysis"] = True
-                st.rerun()
+            cols[i % 2].button(code, key="pop_%s" % code, width="stretch",
+                               on_click=_apply_symbol, args=(code,))
 
     st.sidebar.markdown("---")
     with st.sidebar.expander("分析设置", expanded=False):
@@ -1044,6 +1148,37 @@ def render_dimensions(p: dict) -> None:
         _factor_block(p, "基本面", title="该维度生成的因子")
 
     with tab4:
+        # ① 主力操盘意图（本次新增维度，放在最前面）
+        mi = p.get("main_intent") or {}
+        if mi:
+            st.markdown("**主力当前操盘意图**")
+            d = mi.get("direction", 0)
+            cls = "up" if d > 0 else ("down" if d < 0 else "flat")
+            st.markdown(
+                "<div class='tip'><b>判定：<span class='%s'>%s</span></b>"
+                "　意图分 <b>%+.2f</b>　强度 %.2f　可信度 %.0f%%"
+                "　持续性 %s 日%s</div>" % (
+                    cls, _esc(mi.get("intent_cn") or "—"), float(mi.get("score") or 0),
+                    float(mi.get("strength") or 0), float(mi.get("confidence") or 0) * 100,
+                    mi.get("persistence") or 0,
+                    ("　次要意图：" + _esc(mi.get("mixed"))) if mi.get("mixed") else ""),
+                unsafe_allow_html=True)
+            if mi.get("next_action"):
+                st.info("操作提示：%s" % mi["next_action"])
+            ev = mi.get("evidence") or []
+            if ev:
+                st.markdown("**判定依据**")
+                for e in ev[:6]:
+                    st.markdown("- %s" % _esc(e))
+            st.caption("原理：单看主力净流入没有意义——同样净流入，股价温和上涨是「吃货」，"
+                       "大涨可能是「拉高出货」前奏，下跌反而是「洗盘」。"
+                       "本判定综合了资金方向、价格表现、量能变化与股价位置。")
+            ser = p.get("intent_series") or []
+            if ser:
+                with st.expander("查看最近 %d 天的意图变化" % len(ser)):
+                    _show_df(pd.DataFrame([{"日期": x.get("date"),
+                                            "意图": x.get("intent_cn"),
+                                            "意图分": x.get("score")} for x in ser]))
         _kv_grid({"近5日主力净额": _big(cap.get("main_net_5d")),
                   "近10日主力净额": _big(cap.get("main_net_10d")),
                   "近20日主力净额": _big(cap.get("main_net_20d")),
@@ -1109,9 +1244,73 @@ def render_dimensions(p: dict) -> None:
     with tab6:
         if mac:
             mac_label = {"macro": "宏观经济指标", "policy": "产业政策",
-                         "commodity": "上下游商品价格", "market_regime": "大盘水位",
+                         "commodity": "上下游商品价格（行业相关）",
+                         "commodity_relevant": "商品相关性筛选说明",
+                         "market_regime": "大盘水位", "industry_names": "所属行业",
                          "industry": "行业周期", "notes": "数据说明"}
+            # ① 大盘与外围股市（本次新增维度）
+            gm = p.get("market_global") or {}
+            # 商品（按行业筛选后只展示相关品种，避免出现与该股无关的原油/铜）
+            rel = mac.get("commodity_relevant") or {}
+            rel_items = rel.get("items") or {}
+            if gm.get("snapshot"):
+                st.markdown("**大盘与外围股市（A股 / 港股 / 美股 / 风险偏好）**")
+                if gm.get("detail"):
+                    st.caption(gm["detail"])
+                grp_label = {"a_share": "A股大盘", "hk": "港股", "us": "美股（隔夜）",
+                             "risk": "风险偏好", "a50": "A50期货"}
+                _show_df(pd.DataFrame([{
+                    "分类": grp_label.get(r.get("group"), r.get("group") or "—"),
+                    "指数": r.get("name"), "最新价": _r(r.get("price")),
+                    "涨跌幅%": _r(r.get("pct_chg")), "数据日期": str(r.get("last_date") or "")[:10],
+                } for r in gm["snapshot"]]))
+                rel = gm.get("relative") or {}
+                if rel:
+                    _kv_grid({
+                        "近5日超额收益%": _r(rel.get("excess_5d")),
+                        "近20日超额收益%": _r(rel.get("excess_20d")),
+                        "近60日超额收益%": _r(rel.get("excess_60d")),
+                        "Beta(250日)": _r(rel.get("beta_250d"), 3),
+                        "相关性(250日)": _r(rel.get("corr_250d"), 3),
+                        "基准指数": rel.get("bench_name"),
+                    })
+                    if rel.get("corr_note"):
+                        st.caption("提示：%s" % rel["corr_note"])
+                if gm.get("linkage"):
+                    st.markdown("**联动关系（用于判断该重点参考哪个指数）**")
+                    st.caption("「同日相关」= 指数当日涨跌与该股当日涨跌的相关性；"
+                               "「领先相关」= 指数**前一日**涨跌与该股当日涨跌的相关性，"
+                               "**领先相关才是可用于预测的关系**（美股隔夜效应即属此类）。")
+                    _show_df(pd.DataFrame([{
+                        "分类": grp_label.get(x.get("group"), x.get("group") or "—"),
+                        "指数": x.get("name"),
+                        "同日相关": _r(x.get("same_day_corr"), 3),
+                        "领先相关": _r(x.get("lead_corr"), 3),
+                        "近5日%": _r(x.get("recent_5d_pct")),
+                        "近20日%": _r(x.get("recent_20d_pct")),
+                        "样本天数": x.get("n"),
+                    } for x in gm["linkage"]]))
             for k, v in mac.items():
+                if k == "commodity":
+                    st.markdown("**上下游商品价格（行业相关）**")
+                    if rel.get("detail"):
+                        st.caption(rel["detail"])
+                    if rel_items:
+                        _show_df(pd.DataFrame([
+                            {"商品": nm, "最新价": _r((d or {}).get("price")),
+                             "涨跌幅%": _r((d or {}).get("pct_chg")),
+                             "日期": str((d or {}).get("date") or "")[:10]}
+                            for nm, d in rel_items.items()]))
+                    else:
+                        st.caption("（本次未取到相关商品价格）")
+                    continue
+                if k == "commodity_relevant":
+                    continue          # 已在上面合并展示
+                if k == "industry_names":
+                    if v:
+                        st.markdown("**所属行业/概念**")
+                        st.caption("、".join(str(x) for x in v))
+                    continue
                 if isinstance(v, dict) and v:
                     st.markdown("**%s**" % mac_label.get(k, k))
                     if k == "market_regime":
@@ -1478,10 +1677,11 @@ def main() -> None:
     # 否则页面滚动时标题会被视口顶边裁掉一半，看起来像"显示不全"）
     st.markdown(
         "<div class='hero appbanner'>"
-        "<h1>个股涨跌概率预测模型V1.0 （田夫开发）</h1>"
+        "<h1>个股涨跌概率预测模型 V1.0</h1>"
         "<div class='meta'>技术面 · 基本面 · 资金面 · 情绪面 · 宏观 · 消息面 · 周期 · "
         "金融理论　→　未来 1天 / 5天 / 10天 / 20天 / 1个月 / 1个季度 / 半年 / 1年 "
         "的涨跌概率与幅度推断</div>"
+        "<div class='byline'>田夫 开发</div>"
         "</div>", unsafe_allow_html=True)
 
     sym_raw = (opts["symbol"] or "").strip()
@@ -1514,10 +1714,16 @@ def main() -> None:
             opts_list = ["%s（%s）" % (h["name"] or h["code"], h["code"]) for h in _hits]
             picked = st.radio(
                 "找到多个匹配，请选择要分析的股票：", opts_list,
-                index=0, horizontal=False, key="name_pick")
-            _idx = opts_list.index(picked)
+                index=0, horizontal=False, key="name_pick",
+                # 用回调写 symbol_input，避免"部件实例化后不可修改"的错误
+                on_change=_apply_symbol,
+                args=(_hits[0]["code"],))
+            # 若用户切换了单选项，按当前选择重新解析
+            try:
+                _idx = opts_list.index(picked)
+            except ValueError:
+                _idx = 0
             sym_raw = _hits[_idx]["code"]
-            st.session_state["symbol_input"] = sym_raw
             st.caption("已解析为代码 **%s**，下方结果对应这只股票。" % sym_raw)
     except Exception as exc:  # noqa: BLE001
         st.warning("代码解析失败：%s" % exc)

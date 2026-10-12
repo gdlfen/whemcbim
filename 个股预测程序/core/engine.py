@@ -367,13 +367,19 @@ class Predictor:
                 bundle.note("大盘指数数据获取失败，已用合成指数替代（相对强度类因子可信度已下调）")
         bundle.index_data = idx
 
-        # 所属板块
+        # 所属板块（同时用于后续"按行业筛选上下游商品"）
         if ds is not None and not self.demo and hasattr(ds, "fetch_sector_list"):
             boards = retry_call(lambda: ds.fetch_sector_list(self.code), attempts=2,
                                 delay=0.6, default=[], label="sector") or []
             if boards:
                 bundle.sentiment["boards_raw"] = boards
                 self.sources["sector"] = "eastmoney"
+        # 行业/概念名称（供商品、政策、题材等模块做相关性判断）
+        board_names = [b.get("name") for b in (bundle.sentiment.get("boards_raw") or [])
+                       if isinstance(b, dict) and b.get("name")]
+        bundle.snapshot["industry_names"] = board_names
+        if board_names:
+            self._log("所属板块：%s" % "、".join(board_names[:8]))
 
     @property
     def display(self) -> str:
@@ -391,8 +397,10 @@ class Predictor:
         steps = [
             ("个股特性与阶段", self._stage),
             ("技术面", self._technical),
+            ("大盘与外围市场", self._global_market),
             ("基本面", self._fundamental),
             ("资金面与主力动向", self._capital),
+            ("主力操盘意图", self._main_intent),
             ("市场情绪与博弈", self._sentiment),
             ("宏观与行业", self._macro),
             ("消息面与突发事件", self._news),
@@ -459,6 +467,61 @@ class Predictor:
                     weekly=bundle.kline_weekly, monthly=bundle.kline_monthly,
                     snapshot=bundle.snapshot, code=self.code)
         self._absorb(bundle, out, "technical", mn)
+
+    # -- 大盘与外围市场 ----------------------------------------------- #
+    def _global_market(self, bundle: AnalysisBundle) -> None:
+        """A股大盘、港股、外围股市的影响（同市场联动 / 港股同步 / 美股隔夜）。"""
+        m = _mod("global_market")
+        if m is None or bundle.ohlcv is None:
+            return
+        try:
+            got = _call(m.analyze_market_influence, bundle.ohlcv,
+                        days=min(self.days, 800), force=False) or {}
+        except Exception as exc:  # noqa: BLE001
+            bundle.error("大盘与外围", exc)
+            return
+        bundle.market = {
+            "snapshot": got.get("snapshot") or {},
+            "linkage": got.get("linkage") or {},
+            "relative": got.get("relative") or {},
+            "detail": got.get("detail") or "",
+        }
+        idx_frames = got.get("indices") or {}
+        if idx_frames:
+            bundle.market["index_history"] = {
+                k: v.tail(120) for k, v in idx_frames.items()
+                if hasattr(v, "tail")
+            }
+        self._absorb(bundle, got.get("factors") or [], "market", "global_market")
+        if got.get("detail"):
+            bundle.note(str(got["detail"]))
+
+    # -- 主力操盘意图 --------------------------------------------------- #
+    def _main_intent(self, bundle: AnalysisBundle) -> None:
+        """主力当前操盘意图（建仓/拉升/洗盘/出货/打压吸筹…）。"""
+        m = _mod("main_force_intent")
+        if m is None or bundle.ohlcv is None:
+            return
+        flow = (bundle.capital or {}).get("flow")
+        try:
+            got = _call(m.analyze_main_force, bundle.ohlcv, flow,
+                        frame=bundle.ohlcv, snapshot=bundle.snapshot) or {}
+        except Exception as exc:  # noqa: BLE001
+            bundle.error("主力意图", exc)
+            return
+        if not got:
+            return
+        bundle.capital["main_intent"] = got
+        try:
+            ser = _call(m.intent_series, bundle.ohlcv, flow, window=30) or []
+            bundle.capital["intent_series"] = ser
+        except Exception as exc:  # noqa: BLE001
+            log.debug("意图序列计算失败: %s", exc)
+        self._absorb(bundle, _call(m.intent_factors, bundle.ohlcv, flow,
+                                   frame=bundle.ohlcv, snapshot=bundle.snapshot) or [],
+                     "capital", "main_force_intent")
+        self._log("主力意图：%s（意图分 %+.2f）"
+                  % (got.get("intent_cn"), got.get("score", 0)))
 
     # -- 基本面 --------------------------------------------------------- #
     def _fundamental(self, bundle: AnalysisBundle) -> None:
@@ -580,7 +643,20 @@ class Predictor:
             if f is not None:
                 policy = retry_call(lambda: f(self.code, bundle.name), attempts=2,
                                     delay=0.5, default={}, label="policy") or {}
-        bundle.macro.update({"macro": macro, "policy": policy, "commodity": commodity})
+        # 上下游商品：**按个股所属行业筛选**，只保留与该公司真正相关的品种
+        industry_names = (bundle.snapshot or {}).get("industry_names") or []
+        commodity_rel: dict = {}
+        try:
+            from . import commodity_industry as CI
+
+            commodity_rel = CI.relevant_commodities(commodity, industry_names)
+            if commodity_rel.get("items"):
+                commodity = {**commodity, **commodity_rel["items"]}
+        except Exception as exc:  # noqa: BLE001
+            bundle.error("上下游商品筛选", exc)
+        bundle.macro.update({"macro": macro, "policy": policy, "commodity": commodity,
+                             "commodity_relevant": commodity_rel,
+                             "industry_names": industry_names})
         if hasattr(m, "market_regime"):
             reg = _call(m.market_regime, bundle.index_data)
             if isinstance(reg, dict):
@@ -590,6 +666,14 @@ class Predictor:
                         commodity=commodity, index_data=bundle.index_data,
                         frame=bundle.ohlcv)
             self._absorb(bundle, out, "macro", "macro")
+        # 补一条"按行业筛选后的商品价格"因子（比通用商品因子更贴合该股）
+        try:
+            from . import commodity_industry as CI
+
+            self._absorb(bundle, CI.commodity_factors(commodity_rel.get("items") or {},
+                                                     industry_names), "macro", "commodity")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("商品因子生成失败: %s", exc)
 
     # -- 消息面 --------------------------------------------------------- #
     def _news(self, bundle: AnalysisBundle) -> None:

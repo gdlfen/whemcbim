@@ -57,10 +57,13 @@ CORE_MODULES = [
     "fundamental", "capital", "sentiment", "macro", "newsflow",
     "seasonality", "theory", "mlmodel", "forecast", "backtest",
     "charts", "report", "engine",
+    # 新增维度模块
+    "global_market", "main_force_intent", "commodity_industry",
 ]
 # 允许缺失的模块（缺失时引擎会自动跳过该维度，只是功能减少）
 OPTIONAL_MODULES = {"datasource", "technical", "fundamental", "capital",
-                    "sentiment", "macro", "newsflow"}
+                    "sentiment", "macro", "newsflow",
+                    "global_market", "main_force_intent", "commodity_industry"}
 
 
 def check_files() -> str:
@@ -280,6 +283,42 @@ def check_app_syntax() -> str:
     return "app.py 编译通过，关键组件齐全（%d 行）" % len(src.splitlines())
 
 
+def check_market_and_intent() -> str:
+    """新增维度：大盘/外围联动、主力操盘意图（离线合成数据）。"""
+    from core import global_market as G
+    from core import main_force_intent as MFI
+    from core.selftest_data import make_ohlcv
+
+    df = make_ohlcv(300, seed=13)
+    # 主力意图：构造"建仓"场景，应能识别
+    import numpy as np
+    import pandas as pd
+    price = np.array(list(np.linspace(30, 20, 200)) + list(np.linspace(20, 20.4, 100)))
+    d = make_ohlcv(300, seed=13, start_price=20.0)
+    d["close"] = price
+    d["high"] = price * 1.01
+    d["low"] = price * 0.99
+    flow = pd.DataFrame({"date": d["date"],
+                         "main_net": [0.0] * 200 + [3e6, 4e6, 2e6, 5e6, 3e6] * 20})
+    r = MFI.analyze_main_force(d, flow)
+    assert r["intent"] != "watch", "建仓场景应识别出非观望意图：%s" % r["intent"]
+    fs = MFI.intent_factors(d, flow)
+    assert fs, "主力意图应生成因子"
+    # 大盘/外围：离线用构造快照验证因子生成
+    snap = {"sh": {"name": "上证指数", "pct_chg": 1.0},
+            "hs300": {"name": "沪深300", "pct_chg": 1.1},
+            "hsi": {"name": "恒生指数", "pct_chg": 0.9},
+            "ixic": {"name": "纳斯达克", "pct_chg": -1.2},
+            "vix": {"name": "VIX", "price": 26.0}}
+    gfs = G.global_market_factors(df, snap, {}, {"hs300": {"same_day_corr": 0.5,
+                                                           "lead_corr": 0.1, "n": 200}})
+    assert len(gfs) >= 3, "大盘/外围应至少生成 3 条因子"
+    ids = {f.id for f in gfs}
+    assert "market_a_share" in ids and "market_us_overnight" in ids
+    return "大盘/外围因子 %d 条；主力意图=%s（意图分 %+.2f）" % (
+        len(gfs), r["intent_cn"], r["score"])
+
+
 def check_online(symbol: str = "600519") -> str:
     """真实数据端到端测试。"""
     from core import datasource as ds
@@ -341,6 +380,7 @@ def main() -> int:
     check("特征/规则分因果性（无未来函数）", check_causality)
     check("特征数值健康（无 ±inf）", check_no_inf)
     check("概率/区间/波动率自洽性", check_probability_consistency)
+    check("大盘/外围联动 + 主力意图", check_market_and_intent)
     if not args.skip_heavy:
         check("AI 模型训练与预测", check_models)
         check("历史回测与随机对照", check_backtest)

@@ -231,6 +231,8 @@ FACTOR_WEIGHTS: dict[str, dict[str, float]] = {
         "capital": 0.55, "technical": 0.45, "sentiment": 0.35, "news": 0.30, "ml": 0.55,
         "fundamental_growth": 1.40, "valuation_percentile": 1.40, "roe_quality": 1.30,
         "industry_policy": 1.25, "macro_cycle": 1.20,
+        # 按行业筛选后的商品价格比"全品类商品"更贴合个股，给更高权重
+        "commodity_cost_industry": 0.85, "commodity_cost": 0.30,
     },
 }
 

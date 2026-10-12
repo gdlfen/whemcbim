@@ -475,6 +475,18 @@ def _dimensions_html(b) -> str:
     pol = mac.get("policy") or {}
     if isinstance(pol, dict) and pol.get("detail"):
         mlines.append("产业政策：" + _html.escape(str(pol["detail"])))
+    # 上下游商品：只写"按行业筛选后"的相关品种，避免出现与个股无关的商品
+    rel = mac.get("commodity_relevant") or {}
+    rel_items = rel.get("items") or {}
+    if isinstance(rel, dict) and rel.get("detail"):
+        mlines.append("上下游商品：" + _html.escape(str(rel["detail"]))
+                      + ("（" + "、".join(
+                          "%s %+.2f%%" % (k, float((v or {}).get("pct_chg") or 0))
+                          for k, v in list(rel_items.items())[:4]) + "）"
+                         if rel_items else ""))
+    elif isinstance(mac.get("commodity"), dict) and mac["commodity"]:
+        mlines.append("上下游商品：" + _html.escape(
+            str(mac["commodity"].get("detail") or "已取到商品价格")))
     out.append("<div class='card'>%s</div>" % ("<br>".join(mlines) if mlines
                                                else "<span class='sub'>（未取得宏观数据）</span>"))
 
