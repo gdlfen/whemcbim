@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import traceback
@@ -67,6 +68,10 @@ st.markdown("""
   .pcard .lbl { font-size:12px; color:#5b6b7c; }
   .pcard .val { font-size:19px; font-weight:700; }
   .pcard .sub { font-size:11px; color:#7b8a99; line-height:1.45; }
+  /* 缺失数据的卡片：灰底 + 虚框，明确区分"没这项分析"与"数据源没给" */
+  .pcard.miss { background:#f6f7f9; border-style:dashed; border-color:#d9dee5; }
+  .pcard.miss .lbl { color:#9aa7b4; }
+  .pcard.miss .val { color:#b6c0ca; }
   .up { color:#c62828; } .down { color:#2e7d32; } .flat { color:#607d8b; }
 
   /* ---------- 顶部标题区 ---------- */
@@ -286,157 +291,528 @@ def _factor_row(f) -> dict:
 
 #: 内部技术字段 → 中文标签。值为 None 表示"不展示给用户"（数据源名、原始键名等）。
 _FIELD_LABELS = {
-    # —— 不展示的内部字段 ——
-    "source": None, "flow_source": None, "fallback_fields": None,
-    "percentile_method": None, "pe_series_note": None, "pb_series_note": None,
-    "breadth_source": None, "vix_source": None, "code": None, "symbol": None,
-    "id": None, "as_of": None, "fetched_at": None, "kind": None,
-    # —— 通用 ——
-    # —— 资金流向表的列（模块内部用英文列名）——
-    "date": "日期", "close": "收盘价", "pct_chg": "涨跌幅%",
-    "main_net": "主力净流入", "small_net": "小单净流入", "mid_net": "中单净流入",
-    "big_net": "大单净流入", "super_net": "超大单净流入",
-    "main_pct": "主力净占比%", "big_pct": "大单净占比%",
-    "super_pct": "超大单净占比%", "small_pct": "小单净占比%",
-    "mid_pct": "中单净占比%", "main_net_5d": "5日主力净额",
-    "main_net_10d": "10日主力净额", "main_net_20d": "20日主力净额",
-    "net_amount": "净流入额", "netamount": "净流入额", "opendate": "日期",
-    "trade": "收盘价", "changeratio": "涨跌幅", "turnover": "换手率%",
-    "r0_net": "超大单净额", "r1_net": "大单净额", "r2_net": "中单净额",
-    "r3_net": "小单净额", "r0": "超大单买入", "r1": "大单买入",
-    "r2": "中单买入", "r3": "小单买入", "ratioamount": "净占比",
-    # —— 其他常见列 ——
-    "ROE": "净资产收益率%", "EPS": "每股收益", "BPS": "每股净资产",
-    "indices": "指数", "boards": "所属板块", "boards_hot": "涨停板块分布",
-    "margin": "两融数据", "matched": "命中关键词", "alias": "别名",
-    "missing": "缺数字段", "n_titles": "分析资讯条数",
-    "earnings": "财报窗口", "fib_window": "斐波那契时间窗",
-    "gann_cycle": "江恩时间周期", "consensus": "理论综合", "today": "当日",
-    "swing_points": "摆动点", "targets": "目标位", "gann_angles": "江恩角度线",
-    "gann_fan": "江恩扇形线", "square_of_9": "江恩四方形",
-    "time_cycles": "时间周期", "seasonal_date": "节气变盘日",
-    "retracement": "回撤位", "extension": "扩展位", "time_windows": "时间窗口",
-    "ma": "均线", "index_close": "指数收盘", "index_pct_avg": "指数平均涨幅%",
-    "broken_rate": "炸板率", "vix": "VIX恐慌指数",
-    # —— 理论模型里残留的英文键 ——
-    "daily": "日线", "weekly": "周线", "monthly": "月线",
-    "origin": "扇形原点", "lines": "角度线组",
-    "time_stage": "时间窗状态", "patterns": "量价组合", "volume_confirm": "量能验证",
-    "high": "区间高点", "low": "区间低点", "targets": "目标位",
-    "nearest_level_role": "档位角色", "sing_points": "摆动点", "swing_points": "摆动点",
-    "pageant": "形态", "phase": "所处阶段", "wave": "浪级",
-    "primary_trend": "主要趋势", "secondary_trend": "次级趋势",
-    "gann_angles": "江恩角度线", "gann_fan": "江恩扇形线",
-    "square_of_9": "江恩四方形", "time_cycles": "时间周期",
-    "seasonal_date": "节气变盘日", "fib_conformance": "波浪吻合度",
-    "hh_hl": "高点抬高+低点抬高", "lh_ll": "高点降低+低点降低",
-    "volume_stage": "量能阶段", "price_stage": "价格阶段",
-    "current_line": "当前角度线", "position": "位置", "score": "评分",
-    "market_state": "市场状态", "sensitivity": "敏感性",
-    "lyapunov_est": "李雅普诺夫指数", "hurst": "Hurst指数",
-    "fractal_dimension": "分形维数", "resonance": "是否共振",
-    "resonance_direction": "共振方向", "strength": "强度",
-    "bull_count": "看涨模型数", "bear_count": "看跌模型数",
-    "detail": "说明", "confidence": "置信度", "direction": "方向",
-    # —— 消息/情绪/板块里残留的英文键 ——
-    "theme_names": "命中题材", "is_hot_theme": "是否处于风口",
-    "sector_rank_pct": "板块强度分位", "leader_stock": "板块龙头",
-    "hottest": "最热板块", "limit_up_count": "涨停家数",
-    "limit_down_count": "跌停家数", "max_continuous": "最高连板",
-    "continuous_count": "连板家数", "limit_up_date": "统计日期",
-    "n_titles": "分析资讯条数", "matched": "命中关键词",
-    "alias": "别名", "missing": "未取到的字段",
-    # —— 商品价格 ——
-    "price": "最新价", "prev_close": "昨收", "open": "开盘",
-    "high_price": "最高", "low_price": "最低", "pct_chg": "涨跌幅%",
-    # —— 资金流向表的列（模块内部用英文列名）——
-    "date": "日期", "close": "收盘价",
-    "main_net": "主力净流入", "small_net": "小单净流入", "mid_net": "中单净流入",
-    "big_net": "大单净流入", "super_net": "超大单净流入",
-    "main_pct": "主力净占比%", "big_pct": "大单净占比%",
-    "super_pct": "超大单净占比%", "small_pct": "小单净占比%",
-    "mid_pct": "中单净占比%", "main_net_5d": "5日主力净额",
-    "main_net_10d": "10日主力净额", "main_net_20d": "20日主力净额",
-    "net_amount": "净流入额", "netamount": "净流入额", "opendate": "日期",
-    "trade": "收盘价", "changeratio": "涨跌幅",
-    "r0_net": "超大单净额", "r1_net": "大单净额", "r2_net": "中单净额",
-    "r3_net": "小单净额", "r0": "超大单买入", "r1": "大单买入",
-    "r2": "中单买入", "r3": "小单买入", "ratioamount": "净占比",
-    # —— 其他常见列 ——
-    "ROE": "净资产收益率%", "EPS": "每股收益", "BPS": "每股净资产",
-    "indices": "指数", "boards": "所属板块", "boards_hot": "涨停板块分布",
-    "margin": "两融数据", "earnings": "财报窗口", "fib_window": "斐波那契时间窗",
-    "gann_cycle": "江恩时间周期", "consensus": "理论综合", "today": "当日",
-    "trend": "趋势", "trend_type": "趋势类型", "trend_r2": "趋势拟合优度R²",
-    "trend_score": "趋势分", "direction": "方向", "score": "评分",
-    "confidence": "置信度", "strength": "强度", "reliability": "可信度",
-    "value": "数值", "level": "级别", "name": "名称", "price": "价格",
-    "change": "变化", "change_pct": "变化%", "ratio": "比率",
-    # —— 个股特性 ——
-    "volatility_level": "波动率级别", "annual_vol_pct": "年化波动率%",
-    "pricing_power": "定价权归属", "top10_float_ratio": "前十大流通股东占比%",
-    "quant_level": "量化活跃度", "character": "个股性格",
-    "pos_250d": "一年区间位置", "drawdown_from_250d_high_pct": "距一年高点%",
-    "up_from_250d_low_pct": "距一年低点%", "ma20_slope_pct_per_day": "MA20斜率(%/日)",
-    "turnover_avg20_pct": "20日均换手%", "amp20_pct": "20日均振幅%",
-    # —— 大盘/宏观 ——
-    "regime": "市场状态", "ma_state": "均线状态", "index_pe_percentile": "指数估值分位",
-    "above_ma250": "是否在年线上方", "drawdown_from_high_pct": "距高点回撤%",
-    "gdp_yoy": "GDP同比%", "cpi_yoy": "CPI同比%", "ppi_yoy": "PPI同比%",
-    "pmi": "制造业PMI", "lpr_1y": "LPR(1年)%", "lpr_5y": "LPR(5年)%",
-    "shibor_3m": "3个月Shibor%", "m2_yoy": "M2同比%",
-    "social_financing_yoy": "社融同比%", "usd_cny": "美元人民币", "vix": "VIX恐慌指数",
-    "subsidy": "是否有补贴", "regulation_risk": "监管风险", "policy_score": "政策评分",
-    "themes": "相关题材", "is_hot_theme": "是否处于风口", "hottest": "最热板块",
-    "sector_rank_pct": "板块强度分位", "leader_stock": "板块龙头",
-    # —— 情绪 ——
-    "value_fg": "指数值", "up_count": "上涨家数", "down_count": "下跌家数",
-    "flat_count": "平盘家数", "limit_up_count": "涨停家数",
-    "limit_down_count": "跌停家数", "max_continuous": "最高连板",
-    "continuous_count": "连板家数", "broken_rate": "炸板率",
-    "breadth_ratio": "涨跌家数比", "limit_up_date": "统计日期",
-    "components": "分项", "board": "板块", "count": "家数",
-    "guba_rank": "股吧人气排名", "guba_rank_change": "人气排名变化",
-    "search_hits": "搜索热度", "search_hits_change_pct": "搜索热度变化%",
-    "retail_score": "散户情绪分", "turnover_pct_rank": "换手率分位",
-    "turnover": "换手率%", "volume_ratio": "量比", "amplitude": "振幅%",
-    # —— 周期/季节 ——
-    "month": "月份", "weekday": "星期", "date": "日期",
-    "hist_month_ret_pct": "该月历史平均收益%", "hist_month_win_rate": "该月历史胜率",
-    "n_years": "统计年数", "prior_ret_pct": "经验先验收益%",
-    "blended_ret_pct": "融合后收益%", "is_window": "是否处于窗口",
-    "window": "窗口类型", "days_to_deadline": "距披露截止日",
-    "next_report_period": "下一报告期", "risk": "风险提示",
-    "in_session": "是否在两会期间", "days_to": "距窗口天数",
-    "is_month_end": "是否月末", "days_to_month_end": "距月末交易日",
-    "anchor_date": "起算日", "anchor_price": "起算价", "anchor_type": "起算点类型",
-    "bars_since": "已过交易日", "in_window": "是否在时间窗内",
-    "next_windows": "未来时间窗", "cycle": "周期", "bars": "交易日数",
-    "near_cycle": "是否临近周期", "solar_terms": "二十四节气",
-    # —— 理论模型 ——
-    "wave": "浪级", "primary_trend": "主要趋势", "secondary_trend": "次级趋势",
-    "phase": "所处阶段", "hh_hl": "高点抬高+低点抬高", "lh_ll": "高点降低+低点降低",
-    "volume_confirm": "量能验证", "fib_conformance": "波浪吻合度",
-    "current_zone": "当前区域", "nearest_support": "最近支撑",
-    "nearest_resistance": "最近压力", "volume_stage": "量能阶段",
-    "price_stage": "价格阶段", "match": "是否共振", "current_line": "当前角度线",
-    "position": "位置", "nearest_level": "最近档位", "position_pct": "区间位置",
-    "hurst": "Hurst指数", "fractal_dimension": "分形维数",
-    "market_state": "市场状态", "sensitivity": "敏感性", "lyapunov_est": "李雅普诺夫指数",
-    "resonance": "是否共振", "resonance_direction": "共振方向",
-    "bull_count": "看涨模型数", "bear_count": "看跌模型数",
-    # —— 资金 ——
-    "main_net_5d": "近5日主力净额", "main_net_10d": "近10日主力净额",
-    "main_net_20d": "近20日主力净额", "main_net_last": "最近一日主力净额",
-    "super_net_last": "最近一日超大单", "big_net_last": "最近一日大单",
-    "mid_net_last": "最近一日中单", "small_net_last": "最近一日小单",
-    "main_pct_last": "主力净占比%", "super_pct_last": "超大单净占比%",
-    "flow_last_date": "资金流数据日", "flow_rows": "资金流天数",
-    "behavior": "主力行为", "consistency": "行为一致性",
-    "net_5d": "近5日净额", "net_20d": "近20日净额",
+    "ROE": "净资产收益率%",
+    "_anchor": None,
+    "_near_cycle": None,
+    "_unit": None,
+    "above_ma250": "是否在年线上方",
+    "agreement": "一致度",
+    "alias": "别名",
+    "aligned": None,
+    "amount": "成交额",
+    "amp20": "20日均振幅%",
+    "anchor_date": "起算日",
+    "angle_label": None,
+    "bars": None,
+    "bars_ahead": "距今交易日",
+    "bars_since": "已过交易日",
+    "behavior": "主力行为",
+    "bench_20d": "基准近20日%",
+    "bench_5d": "基准近5日%",
+    "bench_60d": "基准近60日%",
+    "bench_name": "基准指数",
+    "best_day": "最强星期",
+    "best_day_name": "最强星期",
+    "beta_250d": "Beta(250日)",
+    "bid_ask": None,
+    "bid_ask_unit": None,
+    "big_1": "大单净额",
+    "big_move": "是否大涨大跌",
+    "big_move_threshold": "大涨阈值%",
+    "big_net": "大单净流入",
+    "big_net_last": "最近一日大单",
+    "blended_ret_pct": "融合后收益%",
+    "boards_raw": None,      # 板块原始表，已有更友好的展示
+    "bps": "每股净资产",
+    "breadth_ratio": "涨跌家数比",
+    "breadth_source": None,
+    "broken_rate": "炸板率",
+    "bull_count": "看涨模型数",
+    "by_weekday": "按星期统计",
+    "calendar": "日历效应",
+    "cash": None,
+    "change": "变化",
+    "change_5d_pct": "5日变化%",
+    "chaos": "混沌理论",
+    "checks": "检查项",
+    "ci_high": None,
+    "ci_low": None,
+    "code": None,
+    "commodity": "上下游商品",
+    "commodity_relevant": None,
+    "components": "分项",
+    "computed": "统计值",
+    "concordance": "一致度",
+    "confidence": "置信度",
+    "continuous_count": "连板家数",
+    "control_degree": "控盘程度",
+    "copper": "铜",
+    "corr_250d": "相关性(250日)",
+    "counter": None,
+    "cross": None,
+    "crude_oil": "原油",
+    "currency": None,
+    "current": "最新值",
+    "current_line": "当前角度线",
+    "current_month": "当前月份",
+    "current_zone": "当前区域",
+    "cycles": "周期列表",
+    "daily": "日线",
+    "date": "日期",
+    "days_ahead": "距今交易日",
+    "detail": "说明",
+    "dimension_weights": None,
+    "dir": None,
+    "divergence": "背离判定",
+    "divergence_detail": "背离说明",
+    "dividend_yield": "股息率%",
+    "dow": "道氏理论",
+    "down": None,
+    "drivers": None,
+    "earnings": "财报窗口",
+    "effects": "生效效应",
+    "elliott": "艾略特波浪",
+    "end": None,
+    "eps_ttm": "每股收益TTM",
+    "ev_ebitda": "EV/EBITDA",
+    "evaluated": None,
+    "evidence": None,
+    "excess_20d": "近20日超额收益%",
+    "excess_5d": "近5日超额收益%",
+    "excess_60d": "近60日超额收益%",
+    "exp_high": "乐观情形%",
+    "exp_low": "悲观情形%",
+    "exp_return": "期望涨跌幅%",
+    "extra": None,
+    "f56": None,
+    "f58": None,
+    "f59": None,
+    "f62": None,
+    "f63": None,
+    "f64": None,
+    "f65": None,
+    "f66": None,
+    "f67": None,
+    "f68": None,
+    "f69": None,
+    "f70": None,
+    "f71": None,
+    "f74": None,
+    "f75": None,
+    "f76": None,
+    "f79": None,
+    "f80": None,
+    "f83": None,
+    "f85": None,
+    "f86": None,
+    "fan": "扇形原理",
+    "fear_greed": "恐慌/贪婪指数",
+    "fib": "斐波那契",
+    "field_count": None,
+    "flat_count": "平盘家数",
+    "float_market_cap": "流通市值",
+    "float_shares": "流通股本",
+    "flow_last_date": "资金流数据日",
+    "flow_rows": "资金流天数",
+    "fractal_dimension": "分形维数",
+    "gann": "江恩理论",
+    "gann_angles": "江恩角度线",
+    "gann_cycle": "江恩时间周期",
+    "gann_fan": "江恩扇形线",
+    "gap_days": None,
+    "gdp_yoy": "GDP同比%",
+    "gold": "黄金",
+    "group": None,
+    "guba_rank": "股吧人气排名",
+    "hh_hl": "高点抬高+低点抬高",
+    "high": "区间高点",
+    "high_price": "最高",
+    "hist_first3_ret": "次月前3日历史收益%",
+    "hist_last3_ret": "月末3日历史收益%",
+    "hist_month_ret_pct": "该月历史平均收益%",
+    "hist_ret_pct": None,
+    "history": None,            # 两融历史序列，仅作图用
+    "holder_concentration": "筹码集中度",
+    "holders_tail": "股东户数",
+    "holiday": "长假效应",
+    "horizon": None,
+    "hottest": "最热板块",
+    "hurst": "Hurst指数",
+    "id": None,
+    "idx": "序号",
+    "in_session": "是否在两会期间",
+    "indices": "指数",
+    "industries": "命中行业",
+    "industry_names": "所属行业",
+    "inflow_days": "净流入天数",
+    "intent": "意图",
+    "intent_cn": "意图",
+    "iron_ore": "铁矿石",
+    "is_earnings_window": "是否财报窗口",
+    "is_month_end": "是否月末",
+    "is_post_holiday": "是否长假后",
+    "is_pre_holiday": "是否长假前",
+    "is_two_sessions": "是否两会期间",
+    "items": None,
+    "key": None,
+    "label": None,
+    "large_cap_pct": "大盘权重近20日%",
+    "last_date": "数据日期",
+    "last_update": "上次学习",
+    "lead_corr": "领先相关",
+    "level": None,
+    "lhb": "龙虎榜",
+    "limit_down": "跌停价",
+    "limit_down_count": "跌停家数",
+    "limit_up": "涨停价",
+    "linkage": None,
+    "lithium_carbonate": "碳酸锂",
+    "lyapunov_est": "李雅普诺夫指数",
+    "ma": "均线",
+    "macro": "宏观经济指标",
+    "main_force_profile": "主力行为",
+    "main_net": "主力净流入",
+    "main_net_10d": "10日主力净额",
+    "main_net_20d": "近20日主力净额",
+    "main_net_5d": "近5日主力净额",
+    "main_net_last": "最近一日主力净额",
+    "main_pct": "主力净占比%",
+    "main_pct_5": "近5日主力净占比%",
+    "main_pct_last": "主力净占比%",
+    "margin": "两融数据",
+    "margin_percentile": "两融分位",
+    "margin_tail": "融资融券",
+    "market": "全市场情绪",
+    "market_cap": "总市值",
+    "market_flag": None,
+    "market_regime": "大盘水位",
+    "market_state": "市场状态",
+    "mean_ret_pct": "平均收益%",
+    "metrics": None,
+    "mid_1": "中单净额",
+    "mid_net_last": "最近一日中单",
+    "mid_pct": "中单净占比%",
+    "missed_weekdays": None,
+    "missing": "缺数字段",
+    "mixed": "次要意图",
+    "model_mix": None,
+    "month": "月份",
+    "month_end": "月末效应",
+    "n": None,
+    "n_holidays": "统计长假数",
+    "n_titles": "分析资讯条数",
+    "n_years": "统计年数",
+    "natural_days": None,
+    "near_cycle": "是否临近周期",
+    "nearest_level_role": "档位角色",
+    "nearest_resistance": "最近压力",
+    "neg": None,
+    "net_1": "最近一日净额",
+    "net_10": "近10日净额",
+    "net_20": "近20日净额",
+    "net_5": "近5日净额",
+    "net_5d": "近5日净额",
+    "net_amount": "净流入额",
+    "new_high": "创一年新高",
+    "new_high_count": "创新高指数个数",
+    "new_high_ratio": "创新高占比",
+    "new_low": "创一年新低",
+    "new_low_count": "创新低指数个数",
+    "next_action": "操作提示",
+    "next_report_period": "下一报告期",
+    "next_windows": "未来时间窗",
+    "north_tail": "北向持股",
+    "note": None,
+    "origin": "扇形原点",
+    "outflow_days": "净流出天数",
+    "p_big_down": "大跌概率",
+    "p_big_up": "大涨概率",
+    "p_down": "下跌概率",
+    "p_flat": "横盘概率",
+    "p_up": "上涨概率",
+    "pageant": "形态",
+    "pb": "PB",
+    "pb_median_5y": "PB五年中位数",
+    "pb_percentile": "PB历史分位%",
+    "pcf": "PCF",
+    "pct": None,
+    "pct_1d": "近1日%",
+    "pct_20d": "近20日%",
+    "pct_5d": "近5日%",
+    "pe_history_years": "估值统计年数",
+    "pe_median_5y": "PE五年中位数",
+    "pe_percentile": "PE历史分位%",
+    "pe_static": "PE(静态)",
+    "pe_ttm": "PE(TTM)",
+    "pending": None,
+    "percentile_method": None,
+    "persistence": "持续性(日)",
+    "phase": "所处阶段",
+    "pmi": "制造业PMI",
+    "policy": "产业政策",
+    "pos": None,
+    "pos_250d": "一年区间位置",
+    "position": "位置",
+    "position_in_day": "当日区间位置",
+    "post10_ret": "节后10日收益%",
+    "post5_ret": "节后5日收益%",
+    "post_idx": None,
+    "pre10_ret": "节前10日收益%",
+    "pre5_ret": "节前5日收益%",
+    "pre_idx": None,
+    "prefix": None,
+    "price": "最新价",
     "price_20d_chg": "近20日涨跌%",
-    "turnover_avg": "平均换手率%", "holder_num_change_pct": "股东户数变化%",
-    "top10_ratio": "前十大占比%", "float_cap": "流通市值",
+    "price_5": None,
+    "price_now": None,
+    "price_stage": "价格阶段",
+    "pricing_power": "定价权归属",
+    "primary_trend": "主要趋势",
+    "projected_bars": None,
+    "ps": "PS",
+    "quant_level": "量化活跃度",
+    "r0_net": "超大单净额",
+    "r2": "中单买入",
+    "r250": None,
+    "r3_net": "小单净额",
+    "rebar": "螺纹钢",
+    "recent_20d_pct": "近20日%",
+    "recent_5d_pct": "近5日%",
+    "regime": "市场状态",
+    "related": None,
+    "relative": "相对强度",
+    "resistance_price": None,
+    "resonance": "是否共振",
+    "resonance_direction": "共振方向",
+    "ret20": "近20日涨幅%",
+    "ret5": "近5日涨幅%",
+    "retail": "散户行为",
+    "retail_score": "散户情绪分",
+    "retracement": "回撤位",
+    "retracements": "回撤位",
+    "rows": None,
+    "rs": None,
+    "rsi": "RSI",
+    "run": None,
+    "same_day_corr": "同日相关",
+    "search_hits": "搜索热度",
+    "seasonal_date": "节气变盘日",
+    "sector": "板块与题材",
+    "sector_rank_pct": "板块强度分位",
+    "segments": None,
+    "series": None,
+    "shibor_3m": "3个月Shibor%",
+    "sigma": "波动率σ",
+    "significant_bool": None,
+    "slope": None,
+    "small_1": "小单净额",
+    "small_cap_pct": "中小盘近20日%",
+    "small_net_last": "最近一日小单",
+    "snap_pct": "当日涨跌%",
+    "snapshot": None,
+    "social_financing_yoy": "社融同比%",
+    "source": None,
+    "square_of_9": "江恩四方形",
+    "stage": "所处阶段",
+    "stage_detail": "阶段说明",
+    "start": None,
+    "state": None,
+    "stock_20d": "个股近20日%",
+    "stock_5d": "个股近5日%",
+    "stock_60d": "个股近60日%",
+    "strength_score": "趋势强度",
+    "style": "市场风格",
+    "style_spread": "大小盘差(pp)",
+    "subsidy": "是否有补贴",
+    "super_1": "超大单净额",
+    "super_net_last": "最近一日超大单",
+    "super_pct": "超大单净占比%",
+    "super_pct_last": "超大单净占比%",
+    "support_price": None,
+    "swing_points": "摆动点",
+    "table": None,
+    "theme_names": "命中题材",
+    "themes": "相关题材",
+    "time": None,
+    "time_cycles": "时间周期",
+    "time_stage": "时间窗状态",
+    "top10_ratio": "前十大占比%",
+    "top10_tail": "前十大流通股东",
+    "total": None,
+    "total_shares": "总股本",
+    "trade": "收盘价",
+    "trend": "趋势",
+    "trend_score": "趋势分",
+    "turnover": "换手率%",
+    "turnover_avg": "平均换手率%",
+    "turnover_avg20_pct": "20日均换手%",
+    "turnover_trend": "换手率趋势",
+    "two_sessions": "两会窗口",
+    "type": None,
+    "up": None,
+    "up_from_250d_low_pct": "距一年低点%",
+    "upper_shadow": "上影线占比",
+    "value": "数值",
+    "value_fg": "指数值",
+    "vol_percentile_inv": "波动率分位(反向)",
+    "vol_ratio": "量比(5/20日)",
+    "volatility_level": "波动率级别",
+    "volume": "成交量",
+    "volume_confirm": "量能验证",
+    "volume_stage": "量能阶段",
+    "votes": "各模型投票",
+    "vpt": "量价时空",
+    "vs_limit_up_pct": "距涨停%",
+    "wave": "浪级",
+    "weekday_best": "最强星期",
+    "weekday_worst": "最弱星期",
+    "weight": None,
+    "win_rate": "胜率",
+    "window": "窗口类型",
+    "worst_day": "最弱星期",
+    "worst_day_name": "最弱星期",
+    "up_count": "上涨家数",
+    "down_count": "下跌家数",
+    "index_pct_avg": "指数平均涨幅%",
+    "boards_hot": "涨停板块分布",
+    "limit_up_count": "涨停家数",
+    "max_continuous": "最高连板",
+    "limit_up_date": "统计日期",
+    "vix": "VIX恐慌指数",
+    "vix_source": None,
+    "as_of": "统计时间",
+    "amp20_pct": "20日均振幅%",
+    "annual_vol_pct": "年化波动率%",
+    "anchor_price": "起算价",
+    "anchor_type": "起算点类型",
+    "ma20_slope_pct_per_day": "MA20斜率(%/日)",
+    "drawdown_from_250d_high_pct": "距一年高点%",
+    "trend_r2": "趋势拟合优度R²",
+    "character": "个股性格",
+    "top10_float_ratio": "前十大流通股东占比%",
+    "trend_type": "趋势类型",
+    "ma5": "MA5",
+    "ma10": "MA10",
+    "ma20": "MA20",
+    "ma30": "MA30",
+    "ma60": "MA60",
+    "ma120": "MA120",
+    "ma250": "MA250",
+    "MA5": "MA5",
+    "MA20": "MA20",
+    "MA60": "MA60",
+    "MA120": "MA120",
+    "MA250": "MA250",
+    "targets": "目标位",
+    "extension": "扩展位",
+    "time_windows": "时间窗口",
+    "nearest_support": "最近支撑",
+    "nearest_level": "最近档位",
+    "position_pct": "区间位置",
+    "fib_conformance": "波浪吻合度",
+    "patterns": "量价组合",
+    "lines": "角度线组",
+    "sensitivity": "敏感性",
+    "lh_ll": "高点降低+低点降低",
+    "secondary_trend": "次级趋势",
+    "bear_count": "看跌模型数",
+    "chain": "链路",
+    "flow_source": None,
+    "turnover_pct_rank": "换手率分位",
+    "guba_rank_change": "人气排名变化",
+    "search_hits_change_pct": "搜索热度变化%",
+    "is_hot_theme": "是否处于风口",
+    "leader_stock": "板块龙头",
+    "matched": "命中关键词",
+    "cpi_yoy": "CPI同比%",
+    "ppi_yoy": "PPI同比%",
+    "lpr_1y": "LPR(1年)%",
+    "lpr_5y": "LPR(5年)%",
+    "m2_yoy": "M2同比%",
+    "usd_cny": "美元人民币",
+    "policy_score": "政策评分",
+    "regulation_risk": "监管风险",
+    "fallback_fields": "兜底字段",
+    "ma_state": "均线状态",
+    "index_pe_percentile": "指数估值分位",
+    "drawdown_from_high_pct": "距高点回撤%",
+    "index_close": "指数收盘",
+    "open": "今开",
+    "prev_close": "昨收",
+    "pct_chg": "涨跌幅%",
+    "amplitude": "振幅%",
+    "volume_ratio": "量比",
+    "name": "名称",
+    "symbol": None,
+    "fetched_at": None,
+    "kind": None,
+    "pe_series_note": "PE口径说明",
+    "pb_series_note": "PB口径说明",
+    "weekly": "周线",
+    "monthly": "月线",
+    "consensus": "理论综合",
+    "score": "评分",
+    "strength": "强度",
+    "direction": "方向",
+    "match": "是否共振",
+    "low": "区间低点",
+    "board": "板块",
+    "boards": "所属板块",
+    "count": "家数",
+    "cycle": "周期",
+    "ratio": "比率",
+    "solar_terms": "二十四节气",
+    "today": "当日",
+    "weekday": "星期",
+    "fib_window": "斐波那契时间窗",
+    "in_window": "是否在时间窗内",
+    "is_window": "是否处于窗口",
+    "days_to": "距窗口天数",
+    "days_to_deadline": "距披露截止日",
+    "days_to_month_end": "距月末交易日",
+    "risk": "风险提示",
+    "hist_month_win_rate": "该月历史胜率",
+    "prior_ret_pct": "经验先验收益%",
+    "holder_num_change_pct": "股东户数变化%",
+    "float_cap": "流通市值",
+    "MA10": "MA10",
+    "MA30": "MA30",
+    "industry_name": "所属行业",
+    "industry_pe_median": "行业中位PE",
+    "industry_pb_median": "行业中位PB",
+    "industry_peers_n": "同业公司数",
+    "board_type": "板块类型",
+    "keyword": "命中关键词",
+    "keywords": "命中关键词",
+    "matched_keywords": "命中关键词",
+    "title": "标题",
+    "solar_term": "节气",
+    "term": "节气",
+    "cycle_days": "周期(交易日)",
+    "cycle_type": "周期类型",
+    "is_near": "是否临近",
+    "hits": "命中次数",
+    "n_hits": "命中次数",
+    "policy_hits": "命中政策",
+    "matched_themes": "命中题材",
+    "sigma_floor": None,
+    "_dirs": None,
+    "_retracement_pct": None,
+    "_structure": None,
+    "_bars": None,
+    "_v1x1": None,
+    "_atr": None,
+    "_volume_ratio": None,
+    "_ret5": None,
+    "_price_position": None,
+    "_streak": None,
+    "_high": None,
+    "_low": None,
+    "_direction": None,
+    "_avg_run": None,
+    "_in_window": None,
+    "_anchor_price": None,
+    "_anchor_type": None,
 }
 
 #: 英文枚举值 → 中文（模块内部返回的英文标签）
@@ -456,13 +832,25 @@ _VALUE_LABELS = {
 
 
 def _label(k: str) -> str | None:
-    """字段名转中文；返回 None 表示该字段不展示。"""
-    if k in _FIELD_LABELS:
-        return _FIELD_LABELS[k]
-    kl = str(k).lower()
-    if kl.endswith("_source") or kl == "source" or kl.startswith("_"):
+    """字段名转中文；返回 None 表示该字段不展示。
+
+    不展示的规则：
+    * **下划线开头一律隐藏** —— 这类键是程序内部字段（``_holidays`` /
+      ``_window`` / ``_years`` / ``_anchor`` / ``_dirs`` 等，模块用来传递
+      中间结果），之前只隐藏了少数几个登记过的，导致 ``_holidays``、
+      ``_window``、``_years`` 直接以英文出现在界面上；
+    * 数据源标记（``*_source``）；
+    * 显式登记为 None 的内部结构键（table/rows/items/新浪原始字段…）。
+    """
+    ks = str(k)
+    if ks.startswith("_"):
         return None
-    return str(k)
+    if ks in _FIELD_LABELS:
+        return _FIELD_LABELS[ks]
+    kl = ks.lower()
+    if kl.endswith("_source") or kl == "source":
+        return None
+    return ks
 
 
 def _df_zh(df: pd.DataFrame, *, drop_internal: bool = True) -> pd.DataFrame:
@@ -492,7 +880,9 @@ def _df_zh(df: pd.DataFrame, *, drop_internal: bool = True) -> pd.DataFrame:
     sub = df.iloc[:, [i for i, _ in picked]].copy()
     names, used = [], set()
     for _, key in picked:
-        lab = _label(key) or key
+        lab = _label(key)
+        if lab is None:
+            continue                    # 内部键不进表格
         base, n = lab, 2
         while lab in used:
             lab = "%s(%d)" % (base, n)
@@ -581,21 +971,34 @@ def _render_value(v, *, depth: int = 0) -> None:
     回撤位""恐慌贪婪分项""周期性窗口"等嵌套数据全部不显示，看起来像数据缺失。
     这里统一处理：标量 → 卡片；字典 → 递归卡片；字典列表 → 表格。
     """
-    if depth > 4:
-        st.caption(_esc(str(v))[:200])
+    if depth > 6:
+        # 极深结构兜底：也**不能**直接把 dict 转成字符串（会出现
+        # "{'score': 0.692, 'turnover_avg': 0.19, ..." 这种原始字典字样），
+        # 而是递归成"键：值"的形式。
+        st.caption(_esc(_compact(v)))
         return
     if isinstance(v, dict):
         if not v:
             st.caption("（空）")
             return
-        flat = {k2: v2 for k2, v2 in v.items()
-                if not isinstance(v2, (dict, list)) and v2 is not None
-                and not (isinstance(v2, float) and v2 != v2)}
+        flat = {}
+        for k2, v2 in v.items():
+            lab = _label(k2)
+            if lab is None:                 # 内部键（下划线开头等）不展示
+                continue
+            if isinstance(v2, (dict, list)) or v2 is None:
+                continue
+            if isinstance(v2, float) and v2 != v2:
+                continue
+            flat[lab] = v2
         if flat:
             _kv_grid(flat)
         for k2, v2 in v.items():
             if isinstance(v2, (dict, list)) and v2:
-                st.markdown("**%s**" % _esc(_label(k2) or k2))
+                lab = _label(k2)
+                if lab is None:
+                    continue
+                st.markdown("**%s**" % _esc(lab))
                 _render_value(v2, depth=depth + 1)
     elif isinstance(v, (list, tuple)):
         if not v:
@@ -615,43 +1018,159 @@ def _render_value(v, *, depth: int = 0) -> None:
             st.write(_short(v))
 
 
+def _compact(v, depth: int = 0) -> str:
+    """把任意嵌套值压成一行可读中文（**不使用 str(dict)**）。
+
+    用于"表格单元格"与"极深结构兜底"这类只放得下一行文本的位置：
+        {'score': 0.89, 'level': '高度控盘'}  →  "评分 0.89、控盘级别 高度控盘"
+    """
+    if depth > 3:
+        return "…"
+    if isinstance(v, dict):
+        bits = []
+        for k, x in v.items():
+            lab = _label(k)
+            if lab is None:
+                continue
+            bits.append("%s %s" % (lab, _compact(x, depth + 1)))
+        return "、".join(bits)
+    if isinstance(v, (list, tuple)):
+        return "、".join(_compact(x, depth + 1) for x in v[:8])
+    return _short(v)
+
+
 def _flatten_row(d: dict) -> dict:
-    """把一行里的嵌套值压成短字符串，便于放进表格。"""
+    """把一行里的嵌套值压成短字符串，便于放进表格（内部键不展示）。"""
     out = {}
     for k, v in d.items():
-        lab = _label(k) or k
-        if isinstance(v, dict):
-            out[lab] = "、".join("%s=%s" % (_label(kk) or kk, _short(vv))
-                                for kk, vv in list(v.items())[:4])
-        elif isinstance(v, (list, tuple)):
-            out[lab] = "、".join(_short(x) for x in v[:6])
+        lab = _label(k)
+        if lab is None:
+            continue
+        if isinstance(v, (dict, list)):
+            out[lab] = _compact(v)
         else:
             out[lab] = v
     return out
 
 
 def _render_section(v: dict, *, depth: int = 0, label_map: dict | None = None) -> None:
-    """渲染一个"分区"：标量走卡片网格，嵌套结构递归展开（不丢数据）。"""
+    """渲染一个"分区"（保留旧名，内部统一走 :func:`render_fields`）。
+
+    缺失的标量字段也会显示（灰底 + "—"），让用户看到"这项分析覆盖了、
+    但本次数据源没提供"，而不是以为程序漏了。
+    """
+    render_fields(v, label_map=label_map, include_missing=True, depth=depth)
+
+
+def _fmt_value(k, v) -> str:
+    """按字段名自动选择数字格式。
+
+    为什么要有它：以前每个页签都要手写 ``"PE(TTM)": _r(snap.get("pe_ttm"))``，
+    既啰嗦又容易漏（漏了就把原始 float 显示成长串小数）。
+    现在统一按"字段名后缀/关键词"决定格式：
+        *%            → 百分数（0~1 的小数自动 ×100）
+        _net/_amount  → 亿/万
+        _shares       → 亿股/万股
+        _ratio/_pct   → 小数
+        其它数值      → %.4g
+    """
+    if isinstance(v, bool) or v is None:
+        return _short(v)
+    if isinstance(v, str):
+        return _short(v)
+    if isinstance(v, (dict, list, tuple)):
+        return _compact(v)
+    if not isinstance(v, (int, float)):
+        return _short(v)
+    f = float(v)
+    if f != f:
+        return "—"
+    ks = str(k)
+    if ks.endswith("%"):
+        # 0~1 之间视为占比/分位（0.0182 → 1.8%），否则本身就是百分数
+        return _pct01(f) if 0.0 <= f <= 1.0 else "%.2f%%" % f
+    if re.search(r"(net|amount|money|flow|cap)", ks, re.I):
+        return _big(f)
+    if re.search(r"(shares|volume)", ks, re.I):
+        return _big(f)
+    if re.search(r"(ratio|slope|r2|brier|corr|beta|score|position|pos_|prob)", ks, re.I):
+        return "%.3f" % f
+    if abs(f) >= 1e8:
+        return _big(f)
+    if abs(f) >= 10000 and abs(f - round(f)) < 1e-9:
+        return "{:,}".format(int(round(f)))
+    return "%.4g" % f
+
+
+def render_fields(v: dict, *, label_map: dict | None = None,
+                  include_missing: bool = True, depth: int = 0) -> None:
+    """**统一渲染入口**：把一个 dict 直接变成界面内容。
+
+    这是收敛重构的核心。以前 9 个页签各自手写
+    ``_kv_grid({中文名: _short(值)})``，导致三类问题反复出现：
+        ① 嵌套字典被 ``_short()`` 变成原始字典字样并截断；
+        ② 未登记的键以英文出现；
+        ③ 长串小数（0.018166804293971925）。
+
+    统一走这里之后，调用方**只传原始 dict**，由本函数负责：
+        · 字段名 → 中文（label_map 优先，其次 _FIELD_LABELS）
+        · 内部键（下划线开头 / 登记为 None）→ 隐藏
+        · 数字格式 → _fmt_value 自动判断
+        · 嵌套 dict → 递归卡片；dict 列表 → 表格
+        · 缺失值 → 显示"—"（灰色虚框），让用户看清"分析了但没数据"
+    """
     if not isinstance(v, dict) or not v:
         return
+    if depth > 6:
+        st.caption(_esc(_compact(v)))
+        return
     lm = label_map or {}
-    flat, nested = {}, {}
+    scalars: dict = {}
+    nested: dict = {}
     for k, vv in v.items():
         lab = lm.get(k)
         if lab is None:
             lab = _label(k)
         if lab is None:
-            continue
-        if isinstance(vv, (dict, list)):
+            continue                       # 内部键：隐藏
+        if isinstance(vv, (dict, tuple)):
+            if vv:
+                nested[lab] = dict(vv)
+        elif isinstance(vv, list):
             if vv:
                 nested[lab] = vv
-        elif vv is not None and not (isinstance(vv, float) and vv != vv):
-            flat[lab] = vv
-    if flat:
-        _kv_grid(flat)
+        else:
+            scalars[lab] = vv
+    if scalars:
+        items = []
+        for lab, vv in scalars.items():
+            missing = (vv is None or (isinstance(vv, float) and vv != vv)
+                       or (isinstance(vv, str) and not vv.strip()))
+            if missing and not include_missing:
+                continue
+            items.append((lab, vv, missing))
+        if items:
+            _kv_grid_items(items)
     for lab, vv in nested.items():
         st.markdown("**%s**" % _esc(lab))
-        _render_value(vv, depth=depth + 1)
+        if isinstance(vv, list):
+            _render_value(vv, depth=depth + 1)
+        else:
+            render_fields(vv, label_map=lm, include_missing=include_missing,
+                          depth=depth + 1)
+
+
+def _kv_grid_items(items: list) -> None:
+    """底层渲染：把 ``[(标签, 值, 是否缺失)]`` 画成卡片网格。"""
+    html = ["<div class='bigprobs'>"]
+    for k, v, missing in items:
+        cls = "pcard miss" if missing else "pcard"
+        val = "—" if missing else _esc(_fmt_value(k, v))
+        html.append("<div class='%s'><div class='lbl'>%s</div>"
+                    "<div class='val' style='font-size:15px'>%s</div></div>"
+                    % (cls, _esc(k), val))
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
 
 
 def _clean_learning_report(symbol: str) -> dict:
@@ -1247,28 +1766,9 @@ def render_dimensions(p: dict) -> None:
          "⑥ 宏观/行业", "⑦ 消息/事件", "⑧ 周期/季节性", "⑨ 理论模型"])
 
     with tab1:
-        _kv_grid({
-            "股票名称": snap.get("name") or p.get("name"),
-            "股票代码": p.get("symbol"),
-            "现价": snap.get("price"),
-            "涨跌幅%": snap.get("pct_chg"),
-            "今开": snap.get("open"), "最高": snap.get("high"), "最低": snap.get("low"),
-            "昨收": snap.get("prev_close"),
-            "成交量(股)": _big(snap.get("volume")),
-            "成交额": _big(snap.get("amount")),
-            "换手率%": snap.get("turnover"),
-            "量比": snap.get("volume_ratio"),
-            "振幅%": snap.get("amplitude"),
-            "PE(TTM)": _r(snap.get("pe_ttm")),
-            "PB": _r(snap.get("pb")),
-            "总市值": _big(snap.get("market_cap")),
-            "流通市值": _big(snap.get("float_market_cap")),
-            "总股本(股)": _big(snap.get("total_shares")),
-            "流通股本(股)": _big(snap.get("float_shares")),
-            "涨停价": _r(snap.get("limit_up")), "跌停价": _r(snap.get("limit_down")),
-            "距涨停%": _r(snap.get("vs_limit_up_pct")),
-            "数据来源": snap.get("source"),
-        })
+        # 行情快照：直接传原始字段，标签与数字格式由 render_fields 统一处理
+        render_fields(snap, label_map={"name": "股票名称", "code": "股票代码",
+                                        "trade": "现价", "price": "现价"})
         if stage:
             st.markdown("**所处阶段与特性判定**")
             stage_label = {
@@ -1282,16 +1782,22 @@ def render_dimensions(p: dict) -> None:
                 "ma20_slope_pct_per_day": "MA20斜率(%/日)",
                 "turnover_avg20_pct": "20日均换手%", "amp20_pct": "20日均振幅%",
                 "code": "代码", "name": "名称", "price": "价格",
+                "control_degree": "控盘程度", "main_force_profile": "主力行为特征",
             }
-            _kv_grid({stage_label.get(k, k): _short(v) for k, v in stage.items()})
+            # 用 _render_section 而不是把自己手工拼字典：
+            # 旧写法 `{stage_label.get(k, k): _short(v) for ...}` 有两个毛病
+            #   ① 嵌套字典（如 control_degree 控盘程度）被 _short() 转成
+            #      "{'score': 0.89, 'turnover_avg': 0.19, 'turnover_trend': nan…"
+            #      这种原始字典字样，还被截断；
+            #   ② 未登记的键直接以英文出现。
+            _render_section(stage, label_map=stage_label)
         if vol:
             st.markdown("**波动率结构**")
-            _kv_grid({"日波动率%": _r(vol.get("daily_pct"), 3),
-                      "年化波动率%": _r(vol.get("annual_pct"), 2),
-                      "20日波动%": _r(vol.get("vol_20"), 3),
-                      "60日波动%": _r(vol.get("vol_60"), 3),
-                      "短长波动比": _r(vol.get("vol_ratio"), 3),
-                      "波动状态": vol.get("regime"), "ATR%": _r(vol.get("atr_pct"), 2)})
+            render_fields(vol, label_map={"daily_pct": "日波动率%",
+                                           "annual_pct": "年化波动率%",
+                                           "vol_20": "20日波动%", "vol_60": "60日波动%",
+                                           "vol_ratio": "短长波动比", "regime": "波动状态",
+                                           "atr_pct": "ATR%"})
         _factor_block(p, "个股特性/阶段", title="该维度生成的因子")
 
     with tab2:
@@ -1302,19 +1808,10 @@ def render_dimensions(p: dict) -> None:
 
     with tab3:
         if val:
-            _kv_grid({"PE(TTM)": _r(val.get("pe_ttm")), "PE(静)": _r(val.get("pe_static")),
-                      "PB": _r(val.get("pb")), "PS": _r(val.get("ps")),
-                      "PCF": _r(val.get("pcf")),
-                      "PE历史分位": _pct(val.get("pe_percentile")),
-                      "PB历史分位": _pct(val.get("pb_percentile")),
-                      "PE五年中位数": _r(val.get("pe_median_5y")),
-                      "PB五年中位数": _r(val.get("pb_median_5y")),
-                      "每股收益TTM": _r(val.get("eps_ttm")),
-                      "每股净资产": _r(val.get("bps")),
-                      "总市值": _big(val.get("market_cap")),
-                      "流通市值": _big(val.get("float_market_cap")),
-                      "股息率%": _r(val.get("dividend_yield")),
-                      "估值来源": val.get("source")})
+            render_fields(val, label_map={"pe_static": "PE(静态)",
+                                           "pe_median_5y": "PE五年中位数",
+                                           "pb_median_5y": "PB五年中位数",
+                                           "eps_ttm": "每股收益TTM", "bps": "每股净资产"})
             if val.get("percentile_method"):
                 st.caption("估值分位口径：%s（%s）" % (
                     val["percentile_method"], val.get("pe_series_note", "")))
@@ -1365,14 +1862,19 @@ def render_dimensions(p: dict) -> None:
                     _show_df(pd.DataFrame([{"日期": x.get("date"),
                                             "意图": x.get("intent_cn"),
                                             "意图分": x.get("score")} for x in ser]))
-        _kv_grid({"近5日主力净额": _big(cap.get("main_net_5d")),
-                  "近10日主力净额": _big(cap.get("main_net_10d")),
-                  "近20日主力净额": _big(cap.get("main_net_20d")),
-                  "最近一日主力净额": _big(cap.get("main_net_last")),
-                  "最近一日超大单": _big(cap.get("super_net_last")),
-                  "最近一日大单": _big(cap.get("big_net_last")),
-                  "资金流数据日": cap.get("flow_last_date"),
-                  "资金流来源": cap.get("flow_source")})
+        render_fields({k: cap.get(k) for k in
+                        ("main_net_5d", "main_net_10d", "main_net_20d",
+                         "main_net_last", "super_net_last", "big_net_last",
+                         "main_pct_last", "super_pct_last",
+                         "flow_last_date", "flow_rows")},
+                       label_map={"main_net_5d": "近5日主力净额",
+                                  "main_net_10d": "近10日主力净额",
+                                  "main_net_20d": "近20日主力净额",
+                                  "main_net_last": "最近一日主力净额",
+                                  "super_net_last": "最近一日超大单",
+                                  "big_net_last": "最近一日大单",
+                                  "main_pct_last": "主力净占比%",
+                                  "super_pct_last": "超大单净占比%"})
         if not any(cap.get(k) is not None for k in
                    ("main_net_5d", "main_net_20d", "main_net_last")):
             st.warning("主力资金数据为空。资金流依赖东财接口（本机网络常被重置），"
@@ -1381,11 +1883,11 @@ def render_dimensions(p: dict) -> None:
         prof = cap.get("main_force_profile") or {}
         if prof:
             st.markdown("**主力行为判定**")
-            _kv_grid({k: _short(v) for k, v in prof.items()})
+            render_fields(prof)
         cd = cap.get("control_degree") or {}
         if cd:
             st.markdown("**控盘程度**")
-            _kv_grid({k: _short(v) for k, v in cd.items()})
+            render_fields(cd)
         for key, label in (("holders_tail", "股东户数（户均持股）"),
                            ("margin_tail", "融资融券"), ("lhb", "龙虎榜"),
                            ("north_tail", "北向持股")):
@@ -1407,7 +1909,12 @@ def render_dimensions(p: dict) -> None:
             }
             for k, v in sent.items():
                 if isinstance(v, dict) and v:
-                    st.markdown("**%s**" % label_map.get(k, _label(k) or k))
+                    _lab = label_map.get(k)
+                    if _lab is None:
+                        _lab = _label(k)
+                    if _lab is None:
+                        continue
+                    st.markdown("**%s**" % _esc(_lab))
                     if k == "market":
                         st.caption("以下为**全市场**统计（大盘情绪），不是该股自身的指标；"
                                    "其中「涨停板块分布」用于判断当日资金在炒什么方向。")
@@ -1415,10 +1922,15 @@ def render_dimensions(p: dict) -> None:
                         st.caption("散户行为是**反向指标**：人气/搜索骤升往往对应短线见顶。")
                     _render_section(v)
                 elif isinstance(v, (list, tuple)) and v:
-                    st.markdown("**%s**" % label_map.get(k, _label(k) or k))
+                    _lab2 = label_map.get(k)
+                    if _lab2 is None:
+                        _lab2 = _label(k)
+                    if _lab2 is None:
+                        continue
+                    st.markdown("**%s**" % _esc(_lab2))
                     _render_value(v)
                 elif isinstance(v, (str, int, float, bool)) and v is not None:
-                    st.write("%s：%s" % (label_map.get(k, _label(k) or k), v))
+                    st.write("%s：%s" % (_label(k), _fmt_value(k, v)))
         else:
             st.info("未取得情绪数据。")
         boards = p.get("sector_boards") or []
@@ -1452,14 +1964,8 @@ def render_dimensions(p: dict) -> None:
                 } for r in gm["snapshot"]]))
                 rel = gm.get("relative") or {}
                 if rel:
-                    _kv_grid({
-                        "近5日超额收益%": _r(rel.get("excess_5d")),
-                        "近20日超额收益%": _r(rel.get("excess_20d")),
-                        "近60日超额收益%": _r(rel.get("excess_60d")),
-                        "Beta(250日)": _r(rel.get("beta_250d"), 3),
-                        "相关性(250日)": _r(rel.get("corr_250d"), 3),
-                        "基准指数": rel.get("bench_name"),
-                    })
+                    render_fields(rel, label_map={"beta_250d": "Beta(250日)",
+                                                   "corr_250d": "相关性(250日)"})
                     if rel.get("corr_note"):
                         st.caption("提示：%s" % rel["corr_note"])
                 # ---- A股指数之间的相互印证 / 顶底背离 ----
@@ -1477,26 +1983,27 @@ def render_dimensions(p: dict) -> None:
                         "创一年新低": "是" if r.get("new_low") else "否",
                     } for r in (cx.get("rows") or [])]))
                     ag = cx.get("agreement") or {}
-                    _kv_grid({
-                        "1日一致度": "%d涨%d跌（%.0f%%）" % (
+                    _kv_grid_items([
+                        ("1日一致度", "%d涨%d跌（%.0f%%）" % (
                             (ag.get("1日") or {}).get("up", 0),
                             (ag.get("1日") or {}).get("down", 0),
-                            ((ag.get("1日") or {}).get("ratio") or 0) * 100),
-                        "5日一致度": "%d涨%d跌（%.0f%%）" % (
+                            ((ag.get("1日") or {}).get("ratio") or 0) * 100), False),
+                        ("5日一致度", "%d涨%d跌（%.0f%%）" % (
                             (ag.get("5日") or {}).get("up", 0),
                             (ag.get("5日") or {}).get("down", 0),
-                            ((ag.get("5日") or {}).get("ratio") or 0) * 100),
-                        "20日一致度": "%d涨%d跌（%.0f%%）" % (
+                            ((ag.get("5日") or {}).get("ratio") or 0) * 100), False),
+                        ("20日一致度", "%d涨%d跌（%.0f%%）" % (
                             (ag.get("20日") or {}).get("up", 0),
                             (ag.get("20日") or {}).get("down", 0),
-                            ((ag.get("20日") or {}).get("ratio") or 0) * 100),
-                        "背离判定": {"top": "顶背离（上涨缺乏广泛性）",
-                                     "bottom": "底背离（下跌过度）",
-                                     "none": "无背离"}.get(cx.get("divergence"), "—"),
-                        "市场风格": cx.get("style"),
-                        "大盘权重近20日%": cx.get("large_cap_pct"),
-                        "中小盘近20日%": cx.get("small_cap_pct"),
-                    })
+                            ((ag.get("20日") or {}).get("ratio") or 0) * 100), False),
+                        ("背离判定", {"top": "顶背离（上涨缺乏广泛性）",
+                                      "bottom": "底背离（下跌过度）",
+                                      "none": "无背离"}.get(cx.get("divergence"), "—"),
+                         False),
+                        ("市场风格", cx.get("style") or "—", False),
+                        ("大盘权重近20日%", cx.get("large_cap_pct"), False),
+                        ("中小盘近20日%", cx.get("small_cap_pct"), False),
+                    ])
                     st.caption("依据**道氏理论**：主要趋势必须得到各指数相互印证。"
                                "若只有个别指数创新高/新低而其余未跟随，即为背离，"
                                "提示上涨不牢或下跌过度。")
@@ -1582,16 +2089,27 @@ def render_dimensions(p: dict) -> None:
                 "report": "汇总", "consensus": "理论综合", "today": "当日",
                 "symbol": None, "as_of": None, "notes": None,
             }
-            flat = {sea_label.get(k, _label(k)) or k: v for k, v in sea.items()
-                    if not isinstance(v, (dict, list))}
-            flat = {k: v for k, v in flat.items() if k and v is not None}
-            if flat:
-                _kv_grid(flat)
+            # 标量字段全部展示（缺数据的显示为"—"，让用户看清覆盖范围）
+            flat = {}
             for k, v in sea.items():
-                lab = sea_label.get(k)
-                if lab is None and sea_label.get(k, "") is None:
+                if isinstance(v, (dict, list)):
                     continue
-                lab = lab or _label(k) or k
+                lab = sea_label.get(k, _label(k))
+                if lab is None:
+                    continue
+                flat[lab] = v
+            if flat:
+                _kv_grid(flat, include_missing=True)
+            for k, v in sea.items():
+                # sea_label 里显式登记为 None 的（symbol/as_of/notes）以及
+                # 内部字段（下划线开头）都不展示
+                if k in sea_label and sea_label[k] is None:
+                    continue
+                lab = sea_label.get(k)
+                if lab is None:
+                    lab = _label(k)
+                if lab is None:
+                    continue
                 if isinstance(v, (dict, list)) and v:
                     st.markdown("**%s**" % _esc(lab))
                     _render_value(v)
@@ -1622,13 +2140,23 @@ def render_dimensions(p: dict) -> None:
             }
             for k, v in th.items():
                 if isinstance(v, dict) and v:
-                    st.markdown("**%s**" % labels.get(k, _label(k) or k))
+                    _lab = labels.get(k)
+                    if _lab is None:
+                        _lab = _label(k)
+                    if _lab is None:
+                        continue
+                    st.markdown("**%s**" % _esc(_lab))
                     _render_section(v, label_map=field_label)
                 elif isinstance(v, (list, tuple)) and v:
-                    st.markdown("**%s**" % labels.get(k, _label(k) or k))
+                    _lab = labels.get(k)
+                    if _lab is None:
+                        _lab = _label(k)
+                    if _lab is None:
+                        continue
+                    st.markdown("**%s**" % _esc(_lab))
                     _render_value(v)
                 elif isinstance(v, (str, int, float, bool)) and v is not None:
-                    st.write("%s：%s" % (field_label.get(k, _label(k) or k), v))
+                    st.write("%s：%s" % (_label(k), _fmt_value(k, v)))
         else:
             st.info("未取得理论模型结果。")
         _factor_block(p, "理论模型", title="该维度生成的因子")
@@ -1654,25 +2182,40 @@ def _all_factors(p: dict) -> list:
     return out
 
 
-def _kv_grid(d: dict) -> None:
+def _kv_grid(d: dict, *, include_missing: bool = False) -> None:
+    """底层卡片网格（**推荐直接用 :func:
+ender_fields**）。
+
+    保留它是为了少数"键已经是中文、值已经格式化好"的场景；
+    注意：dict/list 值会被跳过（请改用 render_fields，它会递归展开而不是丢数据）。
+    """
     items = []
     for k, v in d.items():
         lab = _label(k)
-        if lab is None or v is None or isinstance(v, (dict, list)):
+        if lab is None or isinstance(v, (dict, list)):
             continue
-        if isinstance(v, float) and v != v:        # NaN
+        missing = (v is None or (isinstance(v, float) and v != v)
+                   or (isinstance(v, str) and v.strip() in ("", "nan", "None")))
+        if missing and not include_missing:
             continue
-        items.append((lab, v))
+        items.append((lab, v, missing))
     if not items:
         st.caption("（本次未取得该项数据）")
         return
-    html = ["<div class='bigprobs'>"]
-    for k, v in items:
-        html.append("<div class='pcard'><div class='lbl'>%s</div>"
-                    "<div class='val' style='font-size:15px'>%s</div></div>"
-                    % (_esc(k), _esc(_short(v))))
-    html.append("</div>")
-    st.markdown("".join(html), unsafe_allow_html=True)
+    _kv_grid_items(items)
+
+
+def _pct01(v):
+    """把 0~1 的分位/占比转成百分数（0.0182 → "1.8%"）。"""
+    try:
+        f = float(v)
+        if f != f:
+            return "—"
+        if 0.0 <= f <= 1.0:
+            return "%.1f%%" % (f * 100)
+        return "%.4g" % f
+    except (TypeError, ValueError):
+        return "—"
 
 
 def _short(v) -> str:
@@ -1777,7 +2320,8 @@ def render_self_learning(p: dict, symbol: str) -> None:
     dw = rep.get("dimension_weights") or {}
     if dw:
         st.markdown("**学到的维度权重（哪个维度的因子对这只股票真正有效）**")
-        _kv_grid({_label(k) or k: "×%.2f" % v for k, v in dw.items()})
+        _kv_grid_items([(_label(k), "×%.2f" % v, False)
+                        for k, v in dw.items() if _label(k)])
         st.caption("权重 >1 表示该维度对这只股票的历史预测更有效，<1 表示效果较差。")
     else:
         st.caption("维度权重尚未形成：它需要**真实预测**（带因子快照）积累到 20 条以上 20 日周期的"

@@ -97,6 +97,19 @@ def _last(series) -> float:
         return float("nan")
 
 
+def _nz(v, dash: str = "—") -> str:
+    """把可能为 None/NaN 的数值转成安全的展示字符串（避免 "None" 出现在界面上）。"""
+    try:
+        if v is None:
+            return dash
+        f = float(v)
+        if f != f:
+            return dash
+        return "%d" % int(f) if abs(f - round(f)) < 1e-9 else "%.2f" % f
+    except (TypeError, ValueError):
+        return dash
+
+
 def _mk(fid: str, name: str, direction: int, strength: float, reliability: float,
         value, detail: str, theory: str, horizon=None) -> Factor:
     return Factor(fid, name, Category.TECH, direction, strength, reliability,
@@ -464,15 +477,19 @@ def trend_and_channel(df: pd.DataFrame, m: pd.DataFrame) -> list:
     try:
         tl = pat.detect_trendlines(df, lookback=150)
         if isinstance(tl, dict):
+            # 触点个数在子字典里（up_line / down_line），
+            # 早期误写成 tl.get("touches") → 永远是 None，界面上显示 "touches=None"
+            up_t = (tl.get("up_line") or {}).get("touches")
+            dn_t = (tl.get("down_line") or {}).get("touches")
             brk = tl.get("break")
             if brk == "up":
                 out.append(_mk("trendline_break", "突破下降趋势线", DIR_BULL, 0.7, 0.68,
-                               "touches=%s" % tl.get("touches"),
+                               "突破点由 %s 个高点连成" % _nz(dn_t),
                                "价格突破由多个高点连成的下降压力线，趋势可能反转向上",
                                "扇形原理/趋势线", _SHORT_MID))
             elif brk == "down":
                 out.append(_mk("trendline_break", "跌破上升趋势线", DIR_BEAR, 0.7, 0.68,
-                               "touches=%s" % tl.get("touches"),
+                               "跌破点由 %s 个低点连成" % _nz(up_t),
                                "价格跌破由多个低点连成的上升支撑线，趋势可能转弱",
                                "扇形原理/趋势线", _SHORT_MID))
             if tl.get("triangle"):

@@ -393,6 +393,79 @@ def check_cache_signature() -> str:
     return line[0].strip() if line else "缓存签名检查通过"
 
 
+def check_labels() -> str:
+    """界面字段标签不得残留英文（金融缩写白名单放行）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_labels.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_labels.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=180)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\n".join(out.strip().splitlines()[-8:])
+        raise AssertionError("字段标签仍残留英文：\n%s" % tail)
+    line = [x for x in out.splitlines() if "字段标签总数" in x]
+    return line[0].strip() if line else "字段标签检查通过"
+
+
+def check_factor_display() -> str:
+    """因子展示值不得出现 None/nan/inf 字样。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_factor_display.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_factor_display.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=180)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\n".join(out.strip().splitlines()[-8:])
+        raise AssertionError("因子展示值含 None/nan：\n%s" % tail)
+    line = [x for x in out.splitlines() if "检查因子" in x]
+    return line[0].strip() if line else "因子展示值检查通过"
+
+
+def check_render_rules() -> str:
+    """渲染层收敛：不得再出现手写渲染写法（英文/None/原始字典的根源）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_render_rules.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_render_rules.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("仍存在手写渲染写法：\\n%s" % tail)
+    line = [x for x in out.splitlines() if "扫描 app.py" in x]
+    return line[0].strip() if line else "渲染规则检查通过"
+
+
+def check_render_output() -> str:
+    """端到端渲染校验：真跑一遍 9 个页签，扫描渲染出来的文本。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_render_output.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_render_output.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=900)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-14:])
+        raise AssertionError("渲染输出存在问题：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines()
+            if "已渲染" in x or "检查标签" in x]
+    return "；".join(keep) if keep else "渲染输出检查通过"
+
+
 def check_online(symbol: str = "600519") -> str:
     """真实数据端到端测试。"""
     from core import datasource as ds
@@ -451,6 +524,10 @@ def main() -> int:
     check("Streamlit 应用可编译", check_app_syntax)
     check("内置字体中文覆盖", check_font_coverage)
     check("缓存函数签名（防 UnhashableParamError）", check_cache_signature)
+    check("界面字段标签无英文残留", check_labels)
+    check("因子展示值无 None/nan", check_factor_display)
+    check("渲染层收敛（无手写渲染）", check_render_rules)
+    check("端到端渲染输出扫描", check_render_output)
 
     print("\n【2】数值内核正确性")
     check("特征/规则分因果性（无未来函数）", check_causality)

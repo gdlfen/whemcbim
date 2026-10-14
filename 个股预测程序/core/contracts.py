@@ -73,6 +73,30 @@ class Category:
     }
 
 
+def _clean_display(v: Any, dash: str = "—") -> Any:
+    """清理因子的展示值：把 None/NaN/inf 统一换成"—"。
+
+    因子值多数直接取自数据源，取不到时是 None 或 NaN。界面与因子表会把它
+    原样打印（例如"PEG 估值 → None"），用户会误以为是程序出错。
+    这里在 Factor 构造时统一处理；字典/列表则递归清理内部值。
+    同时把嵌套值里的 None/NaN 也换掉，避免出现 {'历史分位': nan} 这种字样。
+    """
+    if v is None:
+        return dash
+    if isinstance(v, float):
+        return dash if (v != v or v in (float("inf"), float("-inf"))) else v
+    if isinstance(v, dict):
+        return {k: _clean_display(x, dash) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_clean_display(x, dash) for x in v]
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s.lower() in ("nan", "none", "null", "inf", "-inf"):
+            return dash
+        return v
+    return v
+
+
 def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     """把 x 限制在 [lo, hi]；NaN/None 一律返回 lo。"""
     try:
@@ -235,6 +259,10 @@ class Factor:
             self.weight_multiplier = 1.0
         if self.horizon is not None:
             self.horizon = tuple(self.horizon)
+        # 展示值清理：因子值常直接来自数据源，取不到时会是 None/NaN。
+        # 这些值会被界面与因子表原样打印，出现"PEG 估值 → None"这种字样，
+        # 既难看又让用户以为是程序 bug，所以在源头统一转成"—"。
+        self.value = _clean_display(self.value)
 
     # -- 派生量 ----------------------------------------------------------- #
     @property

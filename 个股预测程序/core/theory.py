@@ -914,7 +914,7 @@ def _wave_now(d: Sequence[float], conf: dict, depth: float = float("nan")) -> st
       → A 浪（大级别调整初段）；其余 → 第 3 浪途中。
     """
     if len(d) < 6:
-        return "unknown"
+        return "未知"
     if not conf.get("impulse"):
         # ABC：比较 C 浪（d3→d4）与当前延伸段（d4→d5）的长度，
         # C 浪已走完 ~85% 以上就认为处于 C 浪末端，否则还在 C 浪途中。
@@ -996,7 +996,7 @@ def elliott_wave(df) -> dict:
     dict：``wave / direction / confidence / swing_points / targets /
     fib_conformance / detail``
     """
-    fallback = {"wave": "unknown", "direction": 0, "confidence": 0.0,
+    fallback = {"wave": "未知", "direction": 0, "confidence": 0.0,
                 "swing_points": [], "targets": [], "fib_conformance": 0.0,
                 "detail": "波浪结构不成立或数据不足，不做浪级判断"}
     f = _ensure_frame(df)
@@ -1032,7 +1032,7 @@ def elliott_wave(df) -> dict:
 
     px = _num(f["close"].iloc[-1], 0.0)
     base = {
-        "wave": "unknown", "direction": 0, "confidence": 0.0,
+        "wave": "未知", "direction": 0, "confidence": 0.0,
         "swing_points": seg, "targets": [], "fib_conformance": 0.0,
         "detail": "",
     }
@@ -1042,7 +1042,7 @@ def elliott_wave(df) -> dict:
         ev, conf = max(scored, key=lambda t: t[0]["conformance"])
         base["fib_conformance"] = _r(ev["conformance"], 3)
         base["detail"] = ("最近 %d 个 ZigZag 摆动点不符合任何标准浪型（最佳吻合度 %.0f%%：%s），"
-                          "按保守原则返回 unknown。当前参考比例 %s" % (
+                          "按保守原则返回「未知」。当前参考比例 %s" % (
                               len(seg), ev["conformance"] * 100, conf["name"],
                               ", ".join("%s=%.2f" % kv for kv in (ev.get("ratios") or {}).items())))
         return base
@@ -2085,7 +2085,7 @@ def _dow_factor(res: dict) -> Factor:
 
 
 def _elliott_factor(res: dict) -> Factor:
-    wave = str(res.get("wave", "unknown"))
+    wave = str(res.get("wave", "未知"))
     if wave == "unknown":
         return _mk_factor(
             "theory_elliott", "艾略特波浪结构", DIR_NEUTRAL, 0.0, 0.15,
@@ -2386,7 +2386,7 @@ def _self_test() -> None:
         ell["wave"], ell["direction"], ell["confidence"], ell["fib_conformance"],
         len(ell["swing_points"]),
         "; ".join("%s=%.2f" % (t["label"], t["price"]) for t in ell["targets"][:2]) or "无"))
-    assert ell["wave"] in {"1", "2", "3", "4", "5", "A", "B", "C", "unknown"}, ell["wave"]
+    assert ell["wave"] in {"1", "2", "3", "4", "5", "A", "B", "C", "未知"}, ell["wave"]
     assert 0.0 <= ell["confidence"] <= 1.0
     assert len(ell["swing_points"]) >= 4, "波浪用摆动点至少 4 个"
     assert 0.0 <= ell["fib_conformance"] <= 1.0
