@@ -374,6 +374,25 @@ def check_font_coverage() -> str:
     return line[0].strip() if line else "字体覆盖检查通过"
 
 
+def check_cache_signature() -> str:
+    """@st.cache_data 函数的参数必须可哈希（回调类参数须带下划线前缀）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_cache_signature.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_cache_signature.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=60)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\n".join(out.strip().splitlines()[-6:])
+        raise AssertionError("缓存函数签名不合规（真机会报 UnhashableParamError）：\n%s"
+                             % tail)
+    line = [x for x in out.splitlines() if "检查了" in x]
+    return line[0].strip() if line else "缓存签名检查通过"
+
+
 def check_online(symbol: str = "600519") -> str:
     """真实数据端到端测试。"""
     from core import datasource as ds
@@ -431,6 +450,7 @@ def main() -> int:
     check("第三方库版本", check_deps, critical=False)
     check("Streamlit 应用可编译", check_app_syntax)
     check("内置字体中文覆盖", check_font_coverage)
+    check("缓存函数签名（防 UnhashableParamError）", check_cache_signature)
 
     print("\n【2】数值内核正确性")
     check("特征/规则分因果性（无未来函数）", check_causality)

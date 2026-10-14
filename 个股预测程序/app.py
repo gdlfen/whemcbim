@@ -158,8 +158,13 @@ DISCLAIMER = ("本页面由量化模型自动生成，所有概率与涨跌幅�
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False, ttl=1800, max_entries=24)
 def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
-                    self_learning: bool = True, progress_cb=None) -> dict:
+                    self_learning: bool = True, _progress_cb=None) -> dict:
     """执行一次完整分析并返回可序列化的结果字典。
+
+    ``_progress_cb`` 前面的下划线是 **Streamlit 的约定**：告诉 cache_data
+    不要尝试哈希这个参数（函数对象无法哈希/序列化，否则会直接报
+    UnhashableParamError）。带下划线的参数不参与缓存键的计算，
+    因此这个进度回调不会影响缓存命中。
 
     注意：matplotlib 图对象与 DataFrame 不放进缓存（体积大、可能不可序列化），
     只缓存**结论性数据**；图表每次由轻量函数现场生成。
@@ -174,9 +179,9 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
         stages.append((stage, pct))
         # 把进度实时透传给界面（Streamlit 首次运行会真正更新进度条；
         # 命中缓存时不会再回调，界面直接显示完成）
-        if progress_cb is not None:
+        if _progress_cb is not None:
             try:
-                progress_cb(stage, pct)
+                _progress_cb(stage, pct)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2033,7 +2038,7 @@ def main() -> None:
         _on_progress("获取行情数据", 0.02)
         payload = cached_analysis(sym_raw, bool(opts["use_ml"]), bool(opts["demo"]),
                                   int(opts["days"]), bool(opts.get("self_learning", True)),
-                                  progress_cb=_on_progress)
+                                  _progress_cb=_on_progress)
         prog.progress(1.0, text="完成")
         time.sleep(0.15)
         prog.empty()
