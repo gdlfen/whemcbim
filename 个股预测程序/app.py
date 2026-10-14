@@ -157,19 +157,28 @@ DISCLAIMER = ("本页面由量化模型自动生成，所有概率与涨跌幅�
 # 数据/分析缓存
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False, ttl=1800, max_entries=24)
-def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int) -> dict:
+def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
+                    self_learning: bool = True, progress_cb=None) -> dict:
     """执行一次完整分析并返回可序列化的结果字典。
 
     注意：matplotlib 图对象与 DataFrame 不放进缓存（体积大、可能不可序列化），
     只缓存**结论性数据**；图表每次由轻量函数现场生成。
     """
     t0 = time.time()
-    predictor = Predictor(symbol, use_ml=use_ml, demo=demo, days=days, verbose=False)
+    predictor = Predictor(symbol, use_ml=use_ml, demo=demo, days=days, verbose=False,
+                          self_learning=self_learning)
 
     stages: list = []
 
     def _progress(stage: str, pct: float) -> None:
         stages.append((stage, pct))
+        # 把进度实时透传给界面（Streamlit 首次运行会真正更新进度条；
+        # 命中缓存时不会再回调，界面直接显示完成）
+        if progress_cb is not None:
+            try:
+                progress_cb(stage, pct)
+            except Exception:  # noqa: BLE001
+                pass
 
     result = predictor.run(progress=_progress)
     bundle = result.bundle
@@ -209,11 +218,11 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int) -> dict:
         "stage": _clean_dict(getattr(bundle, "stage", {}) or {}),
         "valuation": _clean_dict(getattr(bundle, "valuation", {}) or {}),
         "capital_brief": _capital_brief(getattr(bundle, "capital", {}) or {}),
-        "sentiment": _deep_clean(getattr(bundle, "sentiment", {}) or {}, depth=2),
-        "macro": _deep_clean(getattr(bundle, "macro", {}) or {}, depth=2),
+        "sentiment": _deep_clean(getattr(bundle, "sentiment", {}) or {}, depth=9),
+        "macro": _deep_clean(getattr(bundle, "macro", {}) or {}, depth=9),
         "news": [n for n in (getattr(bundle, "news", []) or []) if isinstance(n, dict)][:25],
-        "seasonality": _deep_clean(getattr(bundle, "seasonality", {}) or {}, depth=1),
-        "theory": _deep_clean(getattr(bundle, "theory", {}) or {}, depth=2),
+        "seasonality": _deep_clean(getattr(bundle, "seasonality", {}) or {}, depth=9),
+        "theory": _deep_clean(getattr(bundle, "theory", {}) or {}, depth=9),
         "financials_tail": _frame_tail(getattr(bundle, "financials", None), 8),
         "sector_boards": (getattr(bundle, "sentiment", {}) or {}).get("boards_raw") or [],
         # ---- 大盘与外围市场（A股/港股/美股/VIX/A50）----
@@ -225,6 +234,10 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int) -> dict:
                           ((getattr(bundle, "capital", {}) or {}).get("intent_series") or [])
                           if isinstance(x, dict)][-30:],
         "stages": stages[-6:],
+        # ---- 自我学习 ----
+        "learning": _deep_clean(result.meta.get("learning") or {}, depth=9),
+        "recorded": _deep_clean(result.meta.get("recorded") or {}, depth=9),
+        "learning_report": _clean_learning_report(result.symbol),
     }
     # 图表所需的最小行情数据（只留最近 320 根，控制缓存体积）
     df = getattr(bundle, "ohlcv", None)
@@ -552,7 +565,107 @@ def _clean_global_market(mk: dict) -> dict:
     links.sort(key=lambda x: -abs(x.get("lead_corr") or 0))
     return {"snapshot": rows, "linkage": links,
             "relative": mk.get("relative") or {},
+            "cross": mk.get("cross") or {},
             "detail": mk.get("detail") or ""}
+
+
+def _render_value(v, *, depth: int = 0) -> None:
+    """把任意嵌套值渲染成界面内容（**绝不静默丢弃**）。
+
+    早期实现里 ``_kv_grid`` 会直接跳过 dict/list 值，导致"理论模型的摆动点/目标位/
+    回撤位""恐慌贪婪分项""周期性窗口"等嵌套数据全部不显示，看起来像数据缺失。
+    这里统一处理：标量 → 卡片；字典 → 递归卡片；字典列表 → 表格。
+    """
+    if depth > 4:
+        st.caption(_esc(str(v))[:200])
+        return
+    if isinstance(v, dict):
+        if not v:
+            st.caption("（空）")
+            return
+        flat = {k2: v2 for k2, v2 in v.items()
+                if not isinstance(v2, (dict, list)) and v2 is not None
+                and not (isinstance(v2, float) and v2 != v2)}
+        if flat:
+            _kv_grid(flat)
+        for k2, v2 in v.items():
+            if isinstance(v2, (dict, list)) and v2:
+                st.markdown("**%s**" % _esc(_label(k2) or k2))
+                _render_value(v2, depth=depth + 1)
+    elif isinstance(v, (list, tuple)):
+        if not v:
+            st.caption("（空）")
+            return
+        if isinstance(v[0], dict):
+            _show_df(pd.DataFrame([_flatten_row(x) for x in v[:50]
+                                   if isinstance(x, dict)]))
+        else:
+            vals = [x for x in v if x is not None
+                    and not (isinstance(x, float) and x != x)]
+            st.caption("、".join(_short(x) for x in vals[:40]) if vals else "（空）")
+    else:
+        if v is None or (isinstance(v, float) and v != v):
+            st.caption("（本次未取得该项数据）")
+        else:
+            st.write(_short(v))
+
+
+def _flatten_row(d: dict) -> dict:
+    """把一行里的嵌套值压成短字符串，便于放进表格。"""
+    out = {}
+    for k, v in d.items():
+        lab = _label(k) or k
+        if isinstance(v, dict):
+            out[lab] = "、".join("%s=%s" % (_label(kk) or kk, _short(vv))
+                                for kk, vv in list(v.items())[:4])
+        elif isinstance(v, (list, tuple)):
+            out[lab] = "、".join(_short(x) for x in v[:6])
+        else:
+            out[lab] = v
+    return out
+
+
+def _render_section(v: dict, *, depth: int = 0, label_map: dict | None = None) -> None:
+    """渲染一个"分区"：标量走卡片网格，嵌套结构递归展开（不丢数据）。"""
+    if not isinstance(v, dict) or not v:
+        return
+    lm = label_map or {}
+    flat, nested = {}, {}
+    for k, vv in v.items():
+        lab = lm.get(k)
+        if lab is None:
+            lab = _label(k)
+        if lab is None:
+            continue
+        if isinstance(vv, (dict, list)):
+            if vv:
+                nested[lab] = vv
+        elif vv is not None and not (isinstance(vv, float) and vv != vv):
+            flat[lab] = vv
+    if flat:
+        _kv_grid(flat)
+    for lab, vv in nested.items():
+        st.markdown("**%s**" % _esc(lab))
+        _render_value(vv, depth=depth + 1)
+
+
+def _clean_learning_report(symbol: str) -> dict:
+    """取该股票的自我学习报告（已核账样本、命中率、校准系数）。"""
+    try:
+        from core import learning as L
+
+        rep = L.calibration_report(symbol) or {}
+        return {
+            "detail": rep.get("detail") or "",
+            "last_update": rep.get("last_update") or "",
+            "evaluated": rep.get("evaluated", 0),
+            "pending": rep.get("pending", 0),
+            "table": [r for r in (rep.get("table") or []) if isinstance(r, dict)],
+            "dimension_weights": rep.get("dimension_weights") or {},
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.debug("读取学习报告失败: %s", exc)
+        return {}
 
 
 def _clean_dict(d: dict, depth: int = 1) -> dict:
@@ -568,16 +681,43 @@ def _clean_dict(d: dict, depth: int = 1) -> dict:
 
 
 def _deep_clean(d, depth: int = 2):
+    """递归清理成可缓存/可 JSON 化的结构。
+
+    **注意**：早期版本这里用很浅的 depth（1~2），导致"情绪/宏观/理论/季节性"里
+    的嵌套字典（如恐慌贪婪分项、理论模型的摆动点/目标位/回撤位、周期性窗口）
+    在传给前端之前就被整片抹成 None——用户看到大片空框格，而原始数据其实是有值的。
+    现在改为保留全部嵌套层级（只做深度上限保护，防止异常深的结构拖慢渲染），
+    并对 DataFrame 等不可序列化对象单独降级。
+    """
     if depth <= 0:
-        return None if isinstance(d, (dict, list)) else d
+        return None if isinstance(d, (dict, list)) else _jsonable(d)
     if isinstance(d, dict):
         return {k: _deep_clean(v, depth - 1) for k, v in d.items()
                 if not isinstance(v, pd.DataFrame)}
     if isinstance(d, (list, tuple)):
-        return [_deep_clean(x, depth - 1) for x in d[:20]]
-    if isinstance(d, (str, int, float, bool)) or d is None:
-        return d
-    return str(d)[:200]
+        return [_deep_clean(x, depth - 1) for x in d]
+    return _jsonable(d)
+
+
+def _jsonable(v):
+    """把值转成可安全展示/缓存的形式（不丢信息）。"""
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, pd.DataFrame):
+        return None
+    if isinstance(v, (list, tuple, dict)):
+        try:
+            return _deep_clean(v, depth=8)
+        except Exception:  # noqa: BLE001
+            return str(v)[:200]
+    try:                                  # numpy / Timestamp 等
+        if hasattr(v, "item"):
+            return v.item()
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+    except Exception:  # noqa: BLE001
+        pass
+    return str(v)[:200]
 
 
 def _frame_tail(df, n: int):
@@ -792,6 +932,10 @@ def sidebar() -> dict:
                            help="无网络或数据源不可用时，用合成数据验证流程与界面")
         days = st.slider("历史数据天数", 400, 3200, 1600, step=200,
                          help="回测与 AI 训练都依赖历史长度，长周期预测建议 ≥1600")
+        self_learning = st.checkbox(
+            "启用自我学习", value=True,
+            help="每次预测写入档案，周期走完后用真实价格核账，"
+                 "并据此校准概率与置信度。样本不足时自动用历史数据回填。关闭后不记录、不校准。")
         do_backtest = st.checkbox("执行历史回测（校准置信度）", value=True,
                                   help="用历史数据检验规则分与未来收益的相关性，"
                                        "并据此对每个周期的置信度打分")
@@ -824,7 +968,7 @@ def sidebar() -> dict:
 这是"看不清楚"的诚实表达，而不是故障。
 """)
     return {"symbol": symbol, "use_ml": use_ml, "demo": demo, "days": days,
-            "backtest": do_backtest}
+            "backtest": do_backtest, "self_learning": self_learning}
 
 
 # --------------------------------------------------------------------------- #
@@ -971,23 +1115,60 @@ def render_forecast_table(p: dict) -> None:
                "**置信度**已根据历史回测结果自动折扣。表格可左右滑动查看全部列。")
 
 
+#: 每张图**各自**的说明（早期版本六张图共用同一句说明，等于没说明）
+_CHART_META = {
+    "price": (
+        "K线与均线",
+        "最近约 180 个交易日的蜡烛图（红涨绿跌）。叠加 MA5/MA20/MA60 三条均线与布林带，"
+        "横向虚线为算法识别出的支撑位（蓝）与压力位（橙）。"
+        "看点在均线排列方向、价格与布林带上下轨的位置关系，以及离支撑/压力还有多少空间。",
+    ),
+    "indicators": (
+        "技术指标",
+        "自上而下依次是 MACD（含红绿柱与 DIF/DEA）、KDJ（含 80/20 超买超卖线）、"
+        "RSI6 与 RSI14（含 70/30 线）。用于判断动能强弱与超买超卖，"
+        "重点看柱状能量变化与指标金叉/死叉的位置。",
+    ),
+    "multi_horizon": (
+        "周期对比",
+        "左图：8 个预测周期的上涨概率（虚线为 50% 基准，红=偏多、绿=偏空）；"
+        "右图：对应的期望涨跌幅。两栏逐行对应同一周期，"
+        "用于一眼看出短中长期结论是否一致（共振）还是互相矛盾。",
+    ),
+    "gauge": (
+        "概率仪表",
+        "把各周期上涨概率画成横向仪表条：红色越满表示看涨把握越大，绿色越满表示越看跌。"
+        "注意右端数字只是概率，不等于幅度——幅度请看「周期对比」或「置信锥」。",
+    ),
+    "cone": (
+        "置信锥",
+        "横轴为 8 个周期（等距排列，非按天数比例），纵轴为预期涨跌幅。"
+        "深色折线是期望涨跌幅，蓝色阴影是约 72% 概率的区间。"
+        "**周期越长阴影越宽**，直观体现「时间越长越不可预测」。",
+    ),
+    "contribution": (
+        "因子贡献",
+        "未来 20 天预测中各因子对方向分的贡献度（%）：红条为看涨贡献、绿条为看跌贡献，"
+        "按贡献绝对值排序。这张图回答的是「**这个结论主要是被什么推出来的**」，"
+        "用于判断结论是否建立在可靠证据上。",
+    ),
+}
+
+
 def render_charts(p: dict) -> None:
     ch = p.get("charts") or {}
     if not ch:
         st.info("暂无图表（数据不足）。")
         return
-    tab_names = [("price", "K线与均线"), ("indicators", "技术指标"),
-                 ("multi_horizon", "周期对比"), ("gauge", "概率仪表"),
-                 ("cone", "置信锥"), ("contribution", "因子贡献")]
-    tabs = st.tabs([n for _, n in tab_names if _ in ch])
+    tabs = st.tabs([_CHART_META[k][0] for k in _CHART_META if k in ch])
     i = 0
-    for key, label in tab_names:
+    for key, (label, desc) in _CHART_META.items():
         if key not in ch:
             continue
         with tabs[i]:
             st.image(ch[key], width="stretch")
+            st.markdown("<div class='tip'>%s</div>" % _esc(desc), unsafe_allow_html=True)
         i += 1
-    st.caption("红=上涨/看涨，绿=下跌/看跌（A 股习惯）。阴影为布林带，虚线为支撑/压力位。")
 
 
 def render_drivers(p: dict) -> None:
@@ -1221,18 +1402,18 @@ def render_dimensions(p: dict) -> None:
             }
             for k, v in sent.items():
                 if isinstance(v, dict) and v:
-                    st.markdown("**%s**" % label_map.get(k, k))
+                    st.markdown("**%s**" % label_map.get(k, _label(k) or k))
                     if k == "market":
                         st.caption("以下为**全市场**统计（大盘情绪），不是该股自身的指标；"
                                    "其中「涨停板块分布」用于判断当日资金在炒什么方向。")
-                    _kv_grid({kk: _short(vv) for kk, vv in v.items()
-                              if not isinstance(vv, (list, dict))})
-                    for kk, vv in v.items():
-                        if isinstance(vv, list) and vv and isinstance(vv[0], dict):
-                            st.caption("· %s" % kk)
-                            _show_df(pd.DataFrame(vv[:15]))
+                    if k == "retail":
+                        st.caption("散户行为是**反向指标**：人气/搜索骤升往往对应短线见顶。")
+                    _render_section(v)
+                elif isinstance(v, (list, tuple)) and v:
+                    st.markdown("**%s**" % label_map.get(k, _label(k) or k))
+                    _render_value(v)
                 elif isinstance(v, (str, int, float, bool)) and v is not None:
-                    st.write("%s：%s" % (k, v))
+                    st.write("%s：%s" % (label_map.get(k, _label(k) or k), v))
         else:
             st.info("未取得情绪数据。")
         boards = p.get("sector_boards") or []
@@ -1276,6 +1457,44 @@ def render_dimensions(p: dict) -> None:
                     })
                     if rel.get("corr_note"):
                         st.caption("提示：%s" % rel["corr_note"])
+                # ---- A股指数之间的相互印证 / 顶底背离 ----
+                cx = gm.get("cross") or {}
+                if cx.get("agreement"):
+                    st.markdown("**A股各指数相互印证与背离**")
+                    if cx.get("detail"):
+                        st.caption(cx["detail"])
+                    _show_df(pd.DataFrame([{
+                        "指数": r.get("name"),
+                        "近1日%": _r(r.get("pct_1d")),
+                        "近5日%": _r(r.get("pct_5d")),
+                        "近20日%": _r(r.get("pct_20d")),
+                        "创一年新高": "是" if r.get("new_high") else "否",
+                        "创一年新低": "是" if r.get("new_low") else "否",
+                    } for r in (cx.get("rows") or [])]))
+                    ag = cx.get("agreement") or {}
+                    _kv_grid({
+                        "1日一致度": "%d涨%d跌（%.0f%%）" % (
+                            (ag.get("1日") or {}).get("up", 0),
+                            (ag.get("1日") or {}).get("down", 0),
+                            ((ag.get("1日") or {}).get("ratio") or 0) * 100),
+                        "5日一致度": "%d涨%d跌（%.0f%%）" % (
+                            (ag.get("5日") or {}).get("up", 0),
+                            (ag.get("5日") or {}).get("down", 0),
+                            ((ag.get("5日") or {}).get("ratio") or 0) * 100),
+                        "20日一致度": "%d涨%d跌（%.0f%%）" % (
+                            (ag.get("20日") or {}).get("up", 0),
+                            (ag.get("20日") or {}).get("down", 0),
+                            ((ag.get("20日") or {}).get("ratio") or 0) * 100),
+                        "背离判定": {"top": "顶背离（上涨缺乏广泛性）",
+                                     "bottom": "底背离（下跌过度）",
+                                     "none": "无背离"}.get(cx.get("divergence"), "—"),
+                        "市场风格": cx.get("style"),
+                        "大盘权重近20日%": cx.get("large_cap_pct"),
+                        "中小盘近20日%": cx.get("small_cap_pct"),
+                    })
+                    st.caption("依据**道氏理论**：主要趋势必须得到各指数相互印证。"
+                               "若只有个别指数创新高/新低而其余未跟随，即为背离，"
+                               "提示上涨不牢或下跌过度。")
                 if gm.get("linkage"):
                     st.markdown("**联动关系（用于判断该重点参考哪个指数）**")
                     st.caption("「同日相关」= 指数当日涨跌与该股当日涨跌的相关性；"
@@ -1316,11 +1535,7 @@ def render_dimensions(p: dict) -> None:
                     if k == "market_regime":
                         st.caption("大盘水位影响所有个股的**系统性风险**，"
                                    "是长周期预测的重要先验。")
-                    _kv_grid({kk: _short(vv) for kk, vv in v.items()
-                              if not isinstance(vv, (dict, list))})
-                    for kk, vv in v.items():
-                        if isinstance(vv, list) and vv and isinstance(vv[0], dict):
-                            _show_df(pd.DataFrame(vv[:12]))
+                    _render_section(v, label_map=mac_label)
         else:
             st.warning("未取得宏观数据（依赖 akshare 宏观接口，受限时用配置默认值兜底）。")
         _factor_block(p, "宏观/行业", title="该维度生成的因子")
@@ -1354,23 +1569,27 @@ def render_dimensions(p: dict) -> None:
             sea_label = {
                 "date": "评估日期", "month": "当前月份", "weekday": "星期",
                 "score": "综合评分", "calendar": "日历效应", "month_effect": "月份效应",
-                "weekday_effect": "星期效应", "holiday": "长假效应",
-                "holiday_effect": "长假效应", "earnings_window": "财报窗口",
-                "two_sessions": "两会窗口", "month_end": "月末效应",
-                "fib_time_window": "斐波那契时间窗", "gann_time_cycle": "江恩时间周期",
-                "solar_terms": "二十四节气", "report": "汇总",
+                "month": "月份效应", "weekday_effect": "星期效应", "holiday": "长假效应",
+                "holiday_effect": "长假效应", "earnings": "财报窗口",
+                "earnings_window": "财报窗口", "two_sessions": "两会窗口",
+                "month_end": "月末效应", "fib_window": "斐波那契时间窗",
+                "gann_cycle": "江恩时间周期", "solar_terms": "二十四节气",
+                "report": "汇总", "consensus": "理论综合", "today": "当日",
+                "symbol": None, "as_of": None, "notes": None,
             }
-            flat = {sea_label.get(k, k): _short(v) for k, v in sea.items()
+            flat = {sea_label.get(k, _label(k)) or k: v for k, v in sea.items()
                     if not isinstance(v, (dict, list))}
-            _kv_grid(flat)
+            flat = {k: v for k, v in flat.items() if k and v is not None}
+            if flat:
+                _kv_grid(flat)
             for k, v in sea.items():
-                if isinstance(v, dict) and v:
-                    st.markdown("**%s**" % sea_label.get(k, k))
-                    _kv_grid({kk: _short(vv) for kk, vv in v.items()
-                              if not isinstance(vv, (dict, list))})
-                    for kk, vv in v.items():
-                        if isinstance(vv, list) and vv and isinstance(vv[0], dict):
-                            _show_df(pd.DataFrame(vv[:10]))
+                lab = sea_label.get(k)
+                if lab is None and sea_label.get(k, "") is None:
+                    continue
+                lab = lab or _label(k) or k
+                if isinstance(v, (dict, list)) and v:
+                    st.markdown("**%s**" % _esc(lab))
+                    _render_value(v)
         else:
             st.info("未取得季节性数据。")
         _factor_block(p, "周期/季节", title="该维度生成的因子")
@@ -1398,15 +1617,13 @@ def render_dimensions(p: dict) -> None:
             }
             for k, v in th.items():
                 if isinstance(v, dict) and v:
-                    st.markdown("**%s**" % labels.get(k, k))
-                    _kv_grid({field_label.get(kk, kk): _short(vv) for kk, vv in v.items()
-                              if not isinstance(vv, (dict, list))})
-                    for kk, vv in v.items():
-                        if isinstance(vv, list) and vv and isinstance(vv[0], dict):
-                            st.caption("· %s" % kk)
-                            _show_df(pd.DataFrame(vv[:12]))
+                    st.markdown("**%s**" % labels.get(k, _label(k) or k))
+                    _render_section(v, label_map=field_label)
+                elif isinstance(v, (list, tuple)) and v:
+                    st.markdown("**%s**" % labels.get(k, _label(k) or k))
+                    _render_value(v)
                 elif isinstance(v, (str, int, float, bool)) and v is not None:
-                    st.write("%s：%s" % (field_label.get(k, k), v))
+                    st.write("%s：%s" % (field_label.get(k, _label(k) or k), v))
         else:
             st.info("未取得理论模型结果。")
         _factor_block(p, "理论模型", title="该维度生成的因子")
@@ -1512,10 +1729,70 @@ def _big(v) -> str:
     return "%.2f" % f
 
 
+def render_self_learning(p: dict, symbol: str) -> None:
+    """展示自我学习状态：历史核账结果、校准系数、维度权重。"""
+    st.markdown("### 自我学习（程序随使用不断校准自己）")
+    rep = p.get("learning_report") or {}
+    info = p.get("learning") or {}
+    rec = p.get("recorded") or {}
+
+    if not rep and not info:
+        st.info("自我学习未启用或暂无数据。可在左侧「分析设置」中开启「启用自我学习」。")
+        return
+
+    st.markdown(
+        "<div class='tip'>这个程序的预测会**被自己记账并回头核对**：每次预测都写入档案，"
+        "周期走完后用真实价格核账，算出「说 60%% 涨的时候实际对了多少」，"
+        "再用这个结果反过来校准概率与置信度。因此**用得越久，它对这只股票越了解**。<br>"
+        "样本不足时会先用历史数据回填一批虚拟预测（严格因果），避免新用户干等几个月。</div>",
+        unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("已核账样本", rep.get("evaluated", 0))
+    c2.metric("待核账（周期未走完）", rep.get("pending", 0))
+    c3.metric("本次新增记录", (rec or {}).get("rows", "—"))
+    c4.metric("上次学习", (rep.get("last_update") or "—")[:10])
+
+    if rep.get("detail"):
+        st.caption(rep["detail"])
+
+    # 冷启动回填说明
+    bf = info.get("backfill") or {}
+    if bf.get("detail"):
+        st.caption("冷启动回填：%s" % bf["detail"])
+
+    table = rep.get("table") or []
+    if table:
+        st.markdown("**各周期核账结果与校准强度**")
+        _show_df(pd.DataFrame(table))
+        st.caption("「方向命中率」= 该周期历史上预测方向对的比例；"
+                   "「置信度乘子」= 学习后对置信度的放大/缩小（>1 更有把握、<1 更保守）；"
+                   "「生效程度」= 样本量决定的收缩系数（0 表示样本太少、暂不生效，1 表示完全生效）。")
+
+    dw = rep.get("dimension_weights") or {}
+    if dw:
+        st.markdown("**学到的维度权重（哪个维度的因子对这只股票真正有效）**")
+        _kv_grid({_label(k) or k: "×%.2f" % v for k, v in dw.items()})
+        st.caption("权重 >1 表示该维度对这只股票的历史预测更有效，<1 表示效果较差。")
+    else:
+        st.caption("维度权重尚未形成：它需要**真实预测**（带因子快照）积累到 20 条以上 20 日周期的"
+                   "核账样本才会生效——历史回填只校准概率与置信度，不含当时的因子快照。"
+                   "继续使用本程序，这部分会随真实使用逐步建立。")
+
+    dec = info.get("learn") or {}
+    if isinstance(dec, dict) and dec.get("by_symbol"):
+        with st.expander("查看学习明细（原始校准参数）"):
+            st.json(dec)
+
+
 def render_backtest(p: dict, do_backtest: bool, symbol: str, days: int, demo: bool) -> None:
     if not do_backtest:
         st.info("已在侧边栏关闭历史回测。")
         return
+    # ---- 自我学习：先展示"程序从历史核账中学到了什么" ----
+    render_self_learning(p, symbol)
+    st.markdown("---")
+    st.markdown("### 历史回测（当前信号的样本外表现）")
     with st.spinner("正在用历史数据回测并校准置信度…"):
         try:
             df = pd.DataFrame(p.get("ohlcv") or {})
@@ -1735,10 +2012,28 @@ def main() -> None:
         return
 
     prog = st.progress(0.0, text="准备中…")
+    _stage_names = {
+        "获取行情数据": "① 获取行情与基本面数据",
+        "八大维度分析": "② 八大维度因子分析（技术/资金/情绪/宏观/消息/周期/理论）",
+        "因子汇总与概率推导": "③ 因子汇总与概率推导",
+        "训练AI模型": "④ 训练 AI 模型",
+        "推导概率": "⑤ 推导各周期概率与幅度",
+        "生成报告": "⑥ 生成报告",
+    }
+
+    def _on_progress(stage: str, pct: float) -> None:
+        try:
+            label = _stage_names.get(stage, stage)
+            prog.progress(min(max(float(pct), 0.0), 1.0),
+                          text="%s ｜ %.0f%%" % (label, float(pct) * 100))
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
-        prog.progress(0.15, text="获取行情与八大维度数据（首次约需 10~60 秒）…")
+        _on_progress("获取行情数据", 0.02)
         payload = cached_analysis(sym_raw, bool(opts["use_ml"]), bool(opts["demo"]),
-                                  int(opts["days"]))
+                                  int(opts["days"]), bool(opts.get("self_learning", True)),
+                                  progress_cb=_on_progress)
         prog.progress(1.0, text="完成")
         time.sleep(0.15)
         prog.empty()

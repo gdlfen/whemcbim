@@ -319,6 +319,61 @@ def check_market_and_intent() -> str:
         len(gfs), r["intent_cn"], r["score"])
 
 
+def check_self_learning() -> str:
+    """自我学习闭环：历史回填 → 核账 → 校准 → 参数可被预测引擎读取。"""
+    import os
+
+    import numpy as np
+    import pandas as pd
+
+    # 用独立目录，避免污染真实档案（放在工作区内，兼容受限环境）
+    _root = os.path.dirname(os.path.abspath(__file__))
+    os.environ["STOCKAI_DATA_DIR"] = os.path.join(_root, ".verify_learn")
+    from core import learning as L
+
+    L.reset("all")
+    rng = np.random.default_rng(3)
+    n = 420
+    dates = pd.bdate_range("2024-06-03", periods=n)
+    rets = rng.normal(0.0008, 0.02, n)
+    closes = 20 * np.cumprod(1 + rets)
+    daily = pd.DataFrame({"date": dates, "open": closes * 0.995, "high": closes * 1.01,
+                          "low": closes * 0.99, "close": closes,
+                          "volume": rng.integers(1e6, 5e6, n).astype(float)})
+    bf = L.backfill_history("VERIFY", daily, step=8, max_points=30)
+    assert bf.get("added", 0) > 0, "历史回填应产生样本：%s" % bf
+    lr = L.learn("VERIFY")
+    assert lr.get("samples", 0) > 0, "学习应有样本"
+    adj = L.get_adjustments("VERIFY", "d20")
+    assert adj and "prob_adjust_logit" in adj and "confidence_mult" in adj, \
+        "应能取到 d20 的校准参数：%s" % adj
+    mult = float(adj["confidence_mult"])
+    assert 0.4 <= mult <= 1.4, "置信度乘子应在合理范围：%s" % mult
+    rep = L.calibration_report("VERIFY")
+    assert rep["evaluated"] > 0 and rep["table"], "学习报告应有内容"
+    L.reset("all")
+    return ("回填 %d 条 → 核账 %d 条 → 校准生效（d20 置信度乘子 %.3f）"
+            % (bf.get("added", 0), rep["evaluated"], mult))
+
+
+def check_font_coverage() -> str:
+    """内置字体是否覆盖源码里所有中文字符（防云端图表出现方块）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_font_coverage.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_font_coverage.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\n".join(out.strip().splitlines()[-6:])
+        raise AssertionError("字体覆盖不足（云端图表会显示方块）：\n%s" % tail)
+    line = [x for x in out.splitlines() if "字形数" in x]
+    return line[0].strip() if line else "字体覆盖检查通过"
+
+
 def check_online(symbol: str = "600519") -> str:
     """真实数据端到端测试。"""
     from core import datasource as ds
@@ -375,12 +430,14 @@ def main() -> int:
     check("核心模块导入", check_imports)
     check("第三方库版本", check_deps, critical=False)
     check("Streamlit 应用可编译", check_app_syntax)
+    check("内置字体中文覆盖", check_font_coverage)
 
     print("\n【2】数值内核正确性")
     check("特征/规则分因果性（无未来函数）", check_causality)
     check("特征数值健康（无 ±inf）", check_no_inf)
     check("概率/区间/波动率自洽性", check_probability_consistency)
     check("大盘/外围联动 + 主力意图", check_market_and_intent)
+    check("自我学习闭环（回填→核账→校准）", check_self_learning)
     if not args.skip_heavy:
         check("AI 模型训练与预测", check_models)
         check("历史回测与随机对照", check_backtest)

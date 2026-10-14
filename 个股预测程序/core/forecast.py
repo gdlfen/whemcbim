@@ -406,6 +406,11 @@ def forecast_one(agg: Aggregated, vol: dict, horizon_key: str,
         strength_score=round(agg.score_pct, 1), drivers=drivers, counter=counter,
         model_mix={k2: round(v2, 3) for k2, v2 in mix.items() if v2 > 0},
     )
+    # 保留"未经自我学习校准"的概率，供预测档案核账时区分两个口径
+    try:
+        fc._p_rule = float(p_up)
+    except Exception:  # noqa: BLE001
+        pass
     note_bits = []
     if agg.evidence < 0.4:
         note_bits.append("有效因子偏少，结论仅供参考")
@@ -560,6 +565,31 @@ def build_forecasts(bundle, *, ml_models: dict | None = None,
     vol = estimate_volatility(df)
     bundle.indicators["volatility"] = vol
 
+    # ---- 自我学习校准：读取该股历史核账得出的校准参数 ------------------ #
+    adjust_map: dict = {}
+    dim_weights: dict = {}
+    if config.FORECAST.get("self_learning", True):
+        try:
+            from . import learning as _learn
+
+            for h in horizons:
+                adj = _learn.get_adjustments(bundle.symbol, h.key)
+                if adj:
+                    adjust_map[h.key] = adj
+            dim_weights = _learn.get_dimension_weights(bundle.symbol) or {}
+            if adjust_map:
+                bundle.indicators["self_learning"] = {
+                    "enabled": True,
+                    "horizons": {k: {"samples": v.get("samples"),
+                                     "hit_rate": v.get("hit_rate"),
+                                     "prob_adjust_logit": v.get("prob_adjust_logit"),
+                                     "confidence_mult": v.get("confidence_mult")}
+                                 for k, v in adjust_map.items()},
+                    "dimension_weights": dim_weights,
+                }
+        except Exception as exc:  # noqa: BLE001
+            log.debug("读取自我学习校准失败: %s", exc)
+
     # ---- AI 模型：训练或使用传入的模型 --------------------------------- #
     ml_preds: dict = {}
     ml_meta: dict = {"enabled": bool(use_ml), "trained": False}
@@ -596,8 +626,42 @@ def build_forecasts(bundle, *, ml_models: dict | None = None,
     for h in horizons:
         agg = aggregate_factors(bundle.factors, h.key)
         aggs[h.key] = agg
-        forecasts.append(forecast_one(agg, vol, h.key, ml_preds.get(h.key),
-                                     price=price, prior=_prior_for(bundle, h), df=df))
+        fc = forecast_one(agg, vol, h.key, ml_preds.get(h.key),
+                          price=price, prior=_prior_for(bundle, h), df=df)
+        # 应用自我学习校准（用真实的核账记录修正概率与置信度）
+        adj = adjust_map.get(h.key)
+        if adj:
+            try:
+                from .utils import logit as _logit, sigmoid as _sigmoid
+
+                lo, hi = config.FORECAST["prob_clip"]
+                z = _logit(fc.p_up) + float(adj.get("prob_adjust_logit") or 0.0)
+                fc.p_up = clamp(_sigmoid(z), lo, hi)
+                fc.p_down = 1 - fc.p_up
+                fc.confidence = clamp(fc.confidence *
+                                      float(adj.get("confidence_mult") or 1.0), 0.03, 0.95)
+                # 概率变了，期望幅度与区间也要跟着重算，保持自洽
+                z_ret = norm_ppf(fc.p_up)
+                fc.exp_return = float(z_ret * fc.sigma * 0.45)
+                fc.ci_low = fc.exp_return - 0.90 * fc.sigma
+                fc.ci_high = fc.exp_return + 0.90 * fc.sigma
+                fc.exp_return_low = fc.exp_return - 0.75 * fc.sigma
+                fc.exp_return_high = fc.exp_return + 0.75 * fc.sigma
+                sd = max(fc.sigma, 1e-6)
+                big = fc.big_move_threshold
+                fc.p_big_up = 1.0 - norm_cdf(big, fc.exp_return, sd)
+                fc.p_big_down = norm_cdf(-big, fc.exp_return, sd)
+                fc.trend = ("看涨" if fc.p_up > 0.5 and abs(z_ret) >= 0.30
+                            else ("看跌" if fc.p_up < 0.5 and abs(z_ret) >= 0.30 else "震荡"))
+                mark = ("本周期已应用自我学习校准（基于该股 %s 条历史核账记录，"
+                        "历史命中率 %s）" % (
+                            adj.get("samples"),
+                            ("%.0f%%" % (adj["hit_rate"] * 100))
+                            if adj.get("hit_rate") is not None else "—"))
+                fc.note = ("%s；%s" % (fc.note, mark)) if fc.note else mark
+            except Exception as exc:  # noqa: BLE001
+                log.debug("应用学习校准失败 %s: %s", h.key, exc)
+        forecasts.append(fc)
     forecasts.sort(key=lambda f: horizon_spec(f.horizon).bars)
 
     consistency = cross_horizon_consistency(forecasts)

@@ -113,6 +113,8 @@ FORECAST = {
         "m1": 0.38, "q1": 0.34, "h1": 0.30, "y1": 0.26,
     },
     "ml_enabled": True,
+    # 自我学习：用历史核账记录校准概率与置信度（详见 core/learning.py）
+    "self_learning": True,
     "ml_model": "auto",          # auto | logit | gbdt | none
     "theory_penalty": 0.15,      # 理论模型因主观性打折的系数
     "long_horizon_fundamental_boost": 1.25,   # 长周期基本面权重放大

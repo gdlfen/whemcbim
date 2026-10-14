@@ -213,7 +213,8 @@ class Predictor:
 
     def __init__(self, symbol: str, name: str = "", *, days: int | None = None,
                  use_ml: bool = True, demo: bool = False, offline: bool = False,
-                 horizons=HORIZONS, verbose: bool = True):
+                 horizons=HORIZONS, verbose: bool = True,
+                 self_learning: bool | None = None):
         self.query = str(symbol or "").strip()
         self.symbol_info = normalize_symbol(self.query)
         self.code = self.symbol_info["code"]
@@ -247,6 +248,9 @@ class Predictor:
         self.offline = offline or config.RUNTIME.get("offline", False)
         self.horizons = tuple(horizons)
         self.verbose = verbose
+        # 自我学习开关：默认跟随配置（config.FORECAST["self_learning"]）
+        self.self_learning = (bool(config.FORECAST.get("self_learning", True))
+                              if self_learning is None else bool(self_learning))
         self.sources: dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
@@ -484,6 +488,7 @@ class Predictor:
             "snapshot": got.get("snapshot") or {},
             "linkage": got.get("linkage") or {},
             "relative": got.get("relative") or {},
+            "cross": got.get("cross") or {},
             "detail": got.get("detail") or "",
         }
         idx_frames = got.get("indices") or {}
@@ -814,6 +819,38 @@ class Predictor:
                                 factors=FactorSet())
         _p("获取行情数据", 0.05)
         self.fetch_data(bundle)
+
+        # ---- 自我学习（第一步）：给历史预测核账，算出校准参数 ---- #
+        # 必须在"概率推导"之前完成，这样本次预测才能用上刚学到的校准。
+        learning_info: dict = {}
+        if self.self_learning:
+            try:
+                from . import learning as _learn
+
+                # 冷启动：档案里该股样本太少时，先用历史数据回填一批虚拟预测，
+                # 否则新用户要等几个月才有校准可用（见 backfill_history 说明）
+                try:
+                    have = len([r for r in _learn.load_ledger(self.code)
+                                if r.get("evaluated")])
+                    if have < _learn.LEARN["min_samples"]:
+                        bf = _learn.backfill_history(self.code, bundle.ohlcv,
+                                                     step=5, max_points=60,
+                                                     name=bundle.name)
+                        if bf.get("added"):
+                            self._log("自我学习：%s" % bf.get("detail"))
+                            learning_info["backfill"] = bf
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("历史回填失败: %s", exc)
+
+                cycle = _learn.run_learning_cycle(self.code, bundle.ohlcv, save=True) or {}
+                learning_info.update(cycle)
+                ev = (cycle.get("evaluate") or {})
+                if ev.get("evaluated"):
+                    self._log("自我学习：%s" % cycle.get("detail"))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("自我学习闭环失败: %s", exc)
+                bundle.error("自我学习", exc)
+
         _p("八大维度分析", 0.20)
         self.analyze(bundle)
         _p("因子汇总与概率推导", 0.72)
@@ -823,6 +860,16 @@ class Predictor:
         result.meta["demo"] = bool(self.demo or self.sources.get("daily", "").startswith("synthetic"))
         result.meta["errors"] = list(bundle.errors)
         result.meta["notes"] = list(bundle.notes)
+        result.meta["learning"] = learning_info
+
+        # ---- 自我学习（第二步）：把本次预测写入档案，供将来核账 ---- #
+        if self.self_learning and not result.meta["demo"]:
+            try:
+                from . import learning as _learn
+
+                result.meta["recorded"] = _learn.record_prediction(result)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("写入预测档案失败: %s", exc)
         _p("生成报告", 0.98)
         return result
 

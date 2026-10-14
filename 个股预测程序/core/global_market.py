@@ -57,6 +57,13 @@ INDICES: dict[str, tuple] = {
     "dji": ("道琼斯", "usDJI", "usDJI", None, "us"),
     "ixic": ("纳斯达克", "usIXIC", "usIXIC", None, "us"),
     "spx": ("标普500", "usINX", "usINX", None, "us"),
+    # ---- 亚太 / 欧洲（隔夜，行情代码以 sina: 前缀表示走新浪 int_ 接口）----
+    # 注：日经、英国富时走新浪 int_ 国际指数接口（腾讯无对应行情）。
+    #     韩国 KOSPI 在实测可用的免费源（新浪 int_/gb_、腾讯 us/hk/jp 前缀、
+    #     akshare index_global_hist_em）中**均取不到**，因此未纳入；
+    #     报告与界面会如实说明"韩国股市数据源不可用"，而不是编造数据。
+    "n225": ("日经225", "sina:int_nikkei", None, None, "asia"),
+    "ftse": ("英国富时100", "sina:int_ftse", None, None, "eu"),
     # ---- 风险偏好 ----
     "vix": ("VIX恐慌指数", "usVIX", None, None, "risk"),
     # ---- A50 期货 ----
@@ -64,12 +71,54 @@ INDICES: dict[str, tuple] = {
 }
 
 GROUP_LABEL = {"a_share": "A股大盘", "hk": "港股", "us": "美股（隔夜）",
+               "asia": "亚太股市（隔夜）", "eu": "欧洲股市（隔夜）",
                "risk": "全球风险偏好", "a50": "A50期货"}
 
 
 # --------------------------------------------------------------------------- #
 # 取数
 # --------------------------------------------------------------------------- #
+def _quote_sina_int(code: str) -> dict:
+    """新浪国际指数行情（``int_`` 前缀，如 ``int_nikkei``）。
+
+    格式与腾讯完全不同：``名称,现价,涨跌额,涨跌幅%``（GBK）。
+    实测可用：int_nikkei（日经）、int_ftse（英国富时）、int_dji/nasdaq/sp500、
+    int_bovespa；**KOSPI 等代码返回空**（该市场暂无可用免费源）。
+    """
+    try:
+        raw = http_get("https://hq.sinajs.cn/list=%s" % code, timeout=8, retries=1,
+                       encoding="gbk",
+                       headers={"Referer": "https://finance.sina.com.cn"})
+        if not raw or "=" not in raw:
+            return {}
+        body = raw.strip().split("=", 1)[-1].strip().strip('";')
+        if not body:
+            return {}
+        p = body.split(",")
+        if len(p) < 4:
+            return {}
+        price = safe_float(p[1])
+        chg = safe_float(p[2])
+        pct = safe_float(p[3])
+        if price != price or price <= 0:
+            return {}
+        prev = price - chg if chg == chg else float("nan")
+        return {"name": str(p[0]).strip(), "price": price, "prev_close": prev,
+                "pct_chg": pct, "source": "sina.int"}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("新浪国际指数 %s 失败: %s", code, exc)
+        return {}
+
+
+def _quote_any(code: str) -> dict:
+    """按行情代码前缀分派到对应数据源。"""
+    if not code:
+        return {}
+    if code.startswith("sina:"):
+        return _quote_sina_int(code.split(":", 1)[1])
+    return _quote_tencent(code)
+
+
 def _quote_tencent(code: str) -> dict:
     """腾讯实时行情（支持 A股/港股/美股/VIX/A50）。
 
@@ -271,7 +320,7 @@ def fetch_global_snapshot(force: bool = False) -> dict:
         out: dict = {}
         for k, spec in INDICES.items():
             name, qcode = spec[0], spec[1]
-            got = retry_call(lambda q=qcode: _quote_tencent(q), attempts=2, delay=0.4,
+            got = retry_call(lambda q=qcode: _quote_any(q), attempts=2, delay=0.4,
                              default={}, label="quote_%s" % k)
             if got:
                 out[k] = {**got, "name": name, "group": spec[4]}
@@ -404,6 +453,214 @@ def relative_strength(stock_df: pd.DataFrame, bench_df: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 # 因子
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# A 股指数之间的相互印证 / 顶底背离
+# --------------------------------------------------------------------------- #
+#: 相互印证时使用的核心指数（同属 A 股，理应高度同向）
+CROSS_KEYS = ("sh", "sz", "cyb", "hs300", "zz500", "kc50")
+#: 大盘股 vs 小盘股的代表（用于判断"二八分化"）
+LARGE_CAP_KEYS = ("hs300", "sh")
+SMALL_CAP_KEYS = ("zz500", "cyb", "kc50")
+
+
+def cross_index_analysis(index_frames: dict, snapshot: dict | None = None,
+                         lookback: int = 120) -> dict:
+    """分析**沪深各大指数之间的相互印证与背离**。
+
+    三件事
+    ------
+    1. **同向性（印证）**：近 1/5/20 日各指数涨跌方向是否一致。
+       全部同向 = 系统性行情，个股跟随概率高；
+       上证涨而创业板跌 = 结构性行情，选错方向的代价很大。
+    2. **顶/底背离**：比较"创新高/新低的指数个数"与指数整体涨幅。
+       例如多数指数未创新高而上证创新高 → 顶背离（上涨不牢）；
+       多数指数未创新低而某指数创新低 → 底背离（下跌过度）。
+    3. **二八分化**：大盘股指数与小盘股指数的强弱差（近 20 日），
+       判断当前是"权重搭台"还是"成长唱戏"。
+
+    Returns
+    -------
+    dict：``{"agreement","direction","divergence","style","detail","rows"}``
+    """
+    out: dict = {"agreement": {}, "divergence": "none", "style": "均衡",
+                 "detail": "", "rows": []}
+    frames = {k: v for k, v in (index_frames or {}).items()
+              if k in CROSS_KEYS and isinstance(v, pd.DataFrame) and len(v) >= 30}
+    if len(frames) < 2:
+        out["detail"] = "A股指数数据不足，无法做相互印证"
+        return out
+    snap = snapshot or {}
+
+    # ---- 1) 各周期涨跌幅与方向 ---- #
+    rows = []
+    for k in CROSS_KEYS:
+        df = frames.get(k)
+        if df is None or df.empty:
+            continue
+        try:
+            c = df["close"].astype(float).dropna()
+            if len(c) < 25:
+                continue
+            r1 = float(c.iloc[-1] / c.iloc[-2] - 1) * 100
+            r5 = float(c.iloc[-1] / c.iloc[-6] - 1) * 100
+            n20 = min(21, len(c))
+            r20 = float(c.iloc[-1] / c.iloc[-n20] - 1) * 100
+            win = min(len(c), 250)
+            hi, lo = float(c.tail(win).max()), float(c.tail(win).min())
+            new_high = bool(c.iloc[-1] >= hi - 1e-9)
+            new_low = bool(c.iloc[-1] <= lo + 1e-9)
+            snap_pct = safe_float((snap.get(k) or {}).get("pct_chg"))
+            rows.append({"key": k, "name": INDICES.get(k, ("",))[0],
+                         "pct_1d": round(r1, 2), "pct_5d": round(r5, 2),
+                         "pct_20d": round(r20, 2),
+                         "new_high": new_high, "new_low": new_low,
+                         "snap_pct": snap_pct if snap_pct == snap_pct else None})
+        except Exception as exc:  # noqa: BLE001
+            log.debug("指数 %s 交叉分析失败: %s", k, exc)
+    out["rows"] = rows
+    if len(rows) < 2:
+        out["detail"] = "有效指数不足，无法做相互印证"
+        return out
+
+    # ---- 2) 同向性（印证）---- #
+    for horizon, fld in (("1日", "pct_1d"), ("5日", "pct_5d"), ("20日", "pct_20d")):
+        vals = [r[fld] for r in rows if r.get(fld) is not None]
+        if not vals:
+            continue
+        ups = sum(1 for v in vals if v > 0)
+        downs = sum(1 for v in vals if v < 0)
+        total = ups + downs
+        if total == 0:
+            continue
+        agree = max(ups, downs) / total
+        out["agreement"][horizon] = {
+            "up": ups, "down": downs, "total": total,
+            "ratio": round(agree, 3),
+            "aligned": bool(agree >= 0.8),
+            "direction": 1 if ups > downs else (-1 if downs > ups else 0),
+        }
+
+    # ---- 3) 顶/底背离 ---- #
+    n_high = sum(1 for r in rows if r.get("new_high"))
+    n_low = sum(1 for r in rows if r.get("new_low"))
+    avg20 = sum(r["pct_20d"] for r in rows) / len(rows)
+    divergence = "none"
+    div_detail = ""
+    if n_high == 1 and len(rows) >= 3 and avg20 > 0:
+        # 只有一个指数创新高、整体涨幅温和 → 上涨不具广泛性
+        divergence = "top"
+        div_detail = ("仅「%s」创出一年新高，其余 %d 个指数未跟上，"
+                      "上涨缺乏广泛性，存在顶背离风险"
+                      % (next(r["name"] for r in rows if r["new_high"]),
+                         len(rows) - 1))
+    elif n_low == 1 and len(rows) >= 3 and avg20 < 0:
+        divergence = "bottom"
+        div_detail = ("仅「%s」创出一年新低，其余 %d 个指数未同步走弱，"
+                      "属于超跌背离，往往先于市场企稳"
+                      % (next(r["name"] for r in rows if r["new_low"]),
+                         len(rows) - 1))
+    elif n_high >= len(rows) - 1 and avg20 > 0:
+        div_detail = "绝大多数指数同步创出一年新高，属全面强势（非背离）"
+    elif n_low >= len(rows) - 1 and avg20 < 0:
+        div_detail = "绝大多数指数同步创出一年新低，属全面弱势（非背离）"
+    out["divergence"] = divergence
+    out["new_high_count"] = n_high
+    out["new_low_count"] = n_low
+    out["divergence_detail"] = div_detail
+
+    # ---- 4) 二八分化 ---- #
+    def _avg(keys):
+        vals = [r["pct_20d"] for r in rows if r["key"] in keys]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    large, small = _avg(LARGE_CAP_KEYS), _avg(SMALL_CAP_KEYS)
+    style = "均衡"
+    spread = float("nan")
+    if large == large and small == small:
+        spread = large - small
+        if spread > 2.0:
+            style = "大盘权重占优（二八分化，资金偏防御）"
+        elif spread < -2.0:
+            style = "中小盘成长占优（资金偏进攻）"
+        else:
+            style = "大小盘基本同步"
+    out["style"] = style
+    out["style_spread"] = round(spread, 2) if spread == spread else None
+    out["large_cap_pct"] = round(large, 2) if large == large else None
+    out["small_cap_pct"] = round(small, 2) if small == small else None
+
+    a5 = out["agreement"].get("5日") or {}
+    out["detail"] = ("A股主要指数近5日 %s（%d涨%d跌，一致度 %.0f%%）；%s%s"
+                     % ("同向" if a5.get("aligned") else "分歧",
+                        a5.get("up", 0), a5.get("down", 0),
+                        (a5.get("ratio") or 0) * 100,
+                        (div_detail + "；") if div_detail else "",
+                        "风格上" + style))
+    return out
+
+
+def cross_index_factors(cross: dict, symbol_names=None) -> list:
+    """把"沪深指数相互印证/背离"转成因子。"""
+    out: list[Factor] = []
+    if not isinstance(cross, dict) or not cross.get("agreement"):
+        return out
+    a5 = cross["agreement"].get("5日") or {}
+    a1 = cross["agreement"].get("1日") or {}
+    ratio = float(a5.get("ratio") or 0)
+    direction = int(a5.get("direction") or 0)
+    if direction:
+        strength = 0.3 + max(0.0, ratio - 0.5) * 1.2
+        out.append(Factor(
+            id="index_cross_agreement",
+            name="沪深指数%s" % ("同向印证" if a5.get("aligned") else "方向分歧"),
+            category=Category.MACRO,
+            direction=DIR_BULL if direction > 0 else DIR_BEAR,
+            strength=min(strength, 0.85),
+            reliability=0.72 if a5.get("aligned") else 0.5,
+            value="近5日 %d涨%d跌（一致度 %.0f%%）；近1日 %d涨%d跌"
+                  % (a5.get("up", 0), a5.get("down", 0), ratio * 100,
+                     a1.get("up", 0), a1.get("down", 0)),
+            detail=("沪深主要指数近5日%s，%s"
+                    % ("高度同向，属系统性行情，个股跟随大盘的概率高"
+                       if a5.get("aligned") else
+                       "方向分歧，属结构性行情，选错风格的代价很大",
+                       "整体" + ("向上" if direction > 0 else "向下"))),
+            theory="指数相互印证/道氏理论", horizon=("d1", "d5", "d10", "d20")))
+    # 顶/底背离
+    div = cross.get("divergence")
+    if div == "top":
+        out.append(Factor(
+            id="index_divergence_cross", name="A股指数顶背离",
+            category=Category.MACRO, direction=DIR_BEAR, strength=0.6, reliability=0.62,
+            value="仅 %d 个指数创新高" % cross.get("new_high_count", 0),
+            detail=str(cross.get("divergence_detail") or "") +
+                   "。历史上「独强」行情往往难以持续，需警惕高位补跌",
+            theory="道氏理论（指数须相互印证）", horizon=("d5", "d10", "d20", "m1")))
+    elif div == "bottom":
+        out.append(Factor(
+            id="index_divergence_cross", name="A股指数底背离",
+            category=Category.MACRO, direction=DIR_BULL, strength=0.55, reliability=0.6,
+            value="仅 %d 个指数创新低" % cross.get("new_low_count", 0),
+            detail=str(cross.get("divergence_detail") or "") +
+                   "。道氏理论认为指数应相互印证，单独走弱常属超跌",
+            theory="道氏理论（指数须相互印证）", horizon=("d5", "d10", "d20")))
+    # 二八分化
+    sp = safe_float(cross.get("style_spread"))
+    if sp == sp and abs(sp) > 2.0:
+        big = sp > 0
+        out.append(Factor(
+            id="index_style_rotation", name="市场风格：%s" % cross.get("style"),
+            category=Category.MACRO,
+            direction=DIR_NEUTRAL, strength=min(abs(sp) / 8.0, 0.6), reliability=0.6,
+            value="近20日 大盘权重 %+.2f%% vs 中小盘 %+.2f%%（差 %.2f pp）"
+                  % (cross.get("large_cap_pct") or 0, cross.get("small_cap_pct") or 0, sp),
+            detail=("当前资金%s，%s"
+                    % ("偏好大盘权重股（防御特征）" if big else "偏好中小盘成长股（进攻特征）",
+                       "若你的股票与当前风格不符，即使大盘上涨也可能不涨")),
+            theory="风格轮动/二八分化", horizon=("d10", "d20", "m1")))
+    return out
+
+
 def global_market_factors(stock_df: pd.DataFrame, snapshot: dict,
                           index_frames: dict | None = None,
                           linkage: dict | None = None,
@@ -607,8 +864,19 @@ def analyze_market_influence(stock_df: pd.DataFrame, days: int = 400,
             bench, bench_name = frames.get("sh"), "上证指数"
         if bench is not None and not bench.empty:
             result["relative"] = relative_strength(stock_df, bench, bench_name)
+        # A股指数之间的相互印证 / 顶底背离（与个股基准无关，只要指数够就算）
+        cross: dict = {}
+        try:
+            cross = cross_index_analysis(frames, snap)
+            result["cross"] = cross
+        except Exception as exc:  # noqa: BLE001
+            log.debug("指数交叉印证失败: %s", exc)
         result["factors"] = global_market_factors(stock_df, snap, frames, lk,
                                                  result["relative"])
+        try:
+            result["factors"] = list(result["factors"]) + cross_index_factors(cross)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("交叉印证因子生成失败: %s", exc)
         got = [v[0] for v in INDICES.values() if v[0]]
         result["detail"] = ("已覆盖 %d 个指数（%s），成功取到历史 %d 个、实时 %d 个"
                            % (len(INDICES), "、".join(GROUP_LABEL.values()),
