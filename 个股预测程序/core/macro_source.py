@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import threading
 
 import pandas as pd
@@ -332,3 +333,63 @@ if __name__ == "__main__":  # pragma: no cover
     save_manual(old)
     print("  空手动文件安全")
     print("\nmacro_source self-test OK")
+
+
+# --------------------------------------------------------------------------- #
+# 打开程序时自动预取（带 TTL 缓存，避免每次回车都重抓 10~20 秒）
+# --------------------------------------------------------------------------- #
+#: 自动预取缓存：{"t": 取数时间, "data": collect() 结果}
+_AUTO_CACHE: dict = {}
+AUTO_TTL = 3600.0          # 1 小时过期；这些是日频/月频数据，1 小时内不会变
+
+#: 6 个宏观项的中文名（顺序即界面顺序）
+MACRO_LABELS = {
+    "cpi": "CPI累计同比%",
+    "ppi": "PPI累计同比%",
+    "pmi": "PMI",
+    "m2": "M2同比%",
+    "lpr": "LPR%",
+    "sse_new_accounts": "沪市A股新开户(万户)",
+}
+
+#: 只能手动填的项（自动源已确认不可得）
+MANUAL_HINT = {
+    "sse_new_accounts": "自动源不可得（上交所仅网页披露），需手动填写",
+}
+
+
+def autoload(*, force: bool = False) -> dict:
+    """自动预取全部宏观项（带 TTL 缓存）。
+
+    目的：**打开程序、还没点「开始分析」时就把能查到的数据填好**，
+    只把确实查不到的（如沪市新开户）留给用户手动填。
+    """
+    now = time.time()
+    with _LOCK:
+        got = dict(_AUTO_CACHE)
+    if (not force) and got.get("data") and (now - float(got.get("t") or 0)) < AUTO_TTL:
+        return dict(got["data"])
+    data = collect()
+    with _LOCK:
+        _AUTO_CACHE["t"] = time.time()
+        _AUTO_CACHE["data"] = data
+    return dict(data)
+
+
+def autoload_meta() -> dict:
+    """预取元信息：取数时间、是否过期、成功/缺失统计。"""
+    with _LOCK:
+        t = float(_AUTO_CACHE.get("t") or 0)
+        data = dict(_AUTO_CACHE.get("data") or {})
+    if not data:
+        return {"fetched": False, "detail": "尚未自动获取"}
+    ok = [k for k, v in data.items() if v.get("value") is not None]
+    miss = [k for k, v in data.items() if v.get("value") is None]
+    fresh = [k for k, v in data.items() if v.get("fresh")]
+    age = (time.time() - t) if t else None
+    missing_txt = ("：" + "、".join(MACRO_LABELS.get(k, k) for k in miss)) if miss else ""
+    return {"fetched": True, "at": t, "age_s": age,
+            "ok": ok, "missing": miss, "fresh": fresh,
+            "expired": (age is not None and age > AUTO_TTL),
+            "detail": "已获取 %d 项（其中新鲜 %d 项），缺失 %d 项%s" % (
+                len(ok), len(fresh), len(miss), missing_txt)}

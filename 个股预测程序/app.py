@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股涨跌概率预测 —— Streamlit 前端 + 后端入口。
+A股涨跌概率预测分析 —— Streamlit 前端 + 后端入口。
 
 部署说明
 --------
@@ -51,7 +51,7 @@ except Exception:  # noqa: BLE001
     pass
 
 st.set_page_config(
-    page_title="A股涨跌概率预测",
+    page_title="A股涨跌概率预测分析",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1565,7 +1565,7 @@ def _apply_symbol(code: str) -> None:
 
 
 def sidebar() -> dict:
-    st.sidebar.title("A股涨跌概率预测")
+    st.sidebar.title("A股涨跌概率预测分析")
     render_freshness(in_sidebar=True)
     render_macro_manual()          # 手动输入宏观数据（含上交所官方链接）
     render_ai_config()             # AI 接口配置
@@ -3525,7 +3525,7 @@ def main() -> None:
     # 否则页面滚动时标题会被视口顶边裁掉一半，看起来像"显示不全"）
     st.markdown(
         "<div class='hero appbanner'>"
-        "<h1>A股涨跌概率预测模型 V2.0</h1>"
+        "<h1>A股涨跌概率预测分析模型 V2.0</h1>"
         "<div class='meta'>技术面 · 基本面 · 资金面 · 情绪面 · 宏观 · 消息面 · 周期 · "
         "金融理论　→　未来 1天 / 5天 / 10天 / 20天 / 1个月 / 1个季度 / 半年 / 1年 "
         "的涨跌概率与幅度推断</div>"
@@ -3533,7 +3533,7 @@ def main() -> None:
         "</div>", unsafe_allow_html=True)
 
     # ================= 先选分析范围（初始界面即可见）================= #
-    st.markdown("#### 选择分析范围")
+    st.markdown("#### ① 选择分析范围")
     # 三个范围：大盘与板块**合并**为一个（板块分析本来就需要大盘波段来定位阶段，
     # 拆成两个反而要跑两遍）。
     # 用 segmented_control：**直接点名称即选中**，不需要额外的「选择」按钮。
