@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-个股涨跌概率预测 —— Streamlit 前端 + 后端入口。
+A股涨跌概率预测 —— Streamlit 前端 + 后端入口。
 
 部署说明
 --------
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import sys
 import time
 import traceback
@@ -39,8 +40,18 @@ for _cand in (_HERE, os.path.dirname(_HERE), os.getcwd()):
     if _cand and os.path.isdir(os.path.join(_cand, "core")) and _cand not in sys.path:
         sys.path.insert(0, _cand)
 
+# akshare 内含 V8（py_mini_racer），并行分析时多线程会撞
+# "IsConfigurablePoolInitialized" 断言直接 abort 进程。
+# 启动即加 V8 锁 + 预热身，确保并行安全。
+try:  # pragma: no cover
+    from core import v8_guard as _v8guard
+
+    _v8guard.install()
+except Exception:  # noqa: BLE001
+    pass
+
 st.set_page_config(
-    page_title="个股涨跌概率预测",
+    page_title="A股涨跌概率预测",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -72,6 +83,25 @@ st.markdown("""
   .pcard.miss { background:#f6f7f9; border-style:dashed; border-color:#d9dee5; }
   .pcard.miss .lbl { color:#9aa7b4; }
   .pcard.miss .val { color:#b6c0ca; }
+  /* ===== 分析范围卡片（要求"突出、明显"）===== */
+  .scopecard { border:2px solid #e3e8ef; border-radius:12px; padding:12px 10px;
+    text-align:center; background:#fafbfc; margin-bottom:6px; min-height:104px;
+    transition: all .15s ease; }
+  .scopecard .scname { font-size:19px; font-weight:800; color:#1f2d3d;
+    margin:2px 0 6px; letter-spacing:.5px; }
+  .scopecard .scdesc { font-size:13.5px; color:#46586c; line-height:1.55; }
+  .scopecard.on { border-color:#c62828; background:#fff5f5;
+    box-shadow:0 3px 14px rgba(198,40,40,.18); }
+  .scopecard.on .scname { color:#c62828; }
+  /* ===== 加深淡色文字（要求"淡色文字颜色略加深"）===== */
+  .stCaption, [data-testid="stCaptionContainer"], small { color:#4a5a6a !important; }
+  .pcard .lbl { color:#3f4f5f; }
+  .pcard .sub { color:#5b6b7c; }
+  .pcard.miss .lbl { color:#77879a; }
+  .pcard.miss .val { color:#8b9bad; }
+  .tip { color:#33414f; }
+  div[data-testid="stMetricLabel"] { color:#44546a !important; }
+
   .up { color:#c62828; } .down { color:#2e7d32; } .flat { color:#607d8b; }
 
   /* ---------- 顶部标题区 ---------- */
@@ -146,10 +176,40 @@ try:
     from core import report as report_mod
     from core.contracts import HORIZONS, Category, horizon_spec
     from core.engine import Predictor
+    from core.progress import ProgressTracker as _ProgressTracker
     from core.utils import cache_clear, get_logger, normalize_symbol
 except Exception as _exc:  # noqa: BLE001
     CORE_ERROR = traceback.format_exc()
     CORE_VERSION = "?"
+
+    class _ProgressTracker:                 # type: ignore[no-redef]
+        """core 导入失败时的替身：只保证进度条不因缺类而崩溃。"""
+
+        def __init__(self) -> None:
+            self.stages = []
+
+        def update(self, stage: str, pct: float) -> None:
+            pass
+
+        def finish(self, error: str | None = None) -> None:
+            pass
+
+        def snapshot(self):
+            return "分析中", 0.0, True
+
+        def smooth_snapshot(self, step_seconds: float = 4.0):
+            return "分析中", 0.0, True
+
+        @property
+        def elapsed(self) -> float:
+            return 0.0
+
+        @property
+        def error(self):
+            return None
+
+        def label(self, names=None) -> str:
+            return "分析中"
 
 log = get_logger()
 
@@ -161,9 +221,82 @@ DISCLAIMER = ("本页面由量化模型自动生成，所有概率与涨跌幅�
 # --------------------------------------------------------------------------- #
 # 数据/分析缓存
 # --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, ttl=900, max_entries=12)
+def cached_market_analysis(scope: str, days: int) -> dict:
+    """只分析大盘 / 板块（不需要个股代码）。
+
+    **本函数必须保持纯粹**：被 @st.cache_data 装饰的函数不能调用任何
+    Streamlit UI（哪怕是经回调间接调用），否则缓存命中时会抛
+    CacheReplayClosureError —— 因为外部布局块可能已不存在，无法重放消息。
+    进度提示请由调用方用 st.spinner 包裹。
+    """
+    from core.engine import analyze_market_scope
+
+    got = analyze_market_scope(scope, days=days) or {}
+    market = _deep_clean(got.get("market") or {}, depth=9)
+    factors = got.get("factors") or []
+    rows = []
+    for f in factors:
+        rows.append({
+            "因子": f.name,
+            "类别": (_label(f.category) if _label(f.category) is not None
+                     else f.category),
+            "方向": {1: "看涨", -1: "看跌", 0: "中性"}.get(f.direction, "中性"),
+            "强度": round(float(f.strength), 3),
+            "可信度": round(float(f.reliability), 3),
+            "观测值": f.value, "说明": f.detail, "理论依据": f.theory,
+        })
+    return {
+        "symbol": "", "name": "大盘与板块" if scope in ("board", "all") else "大盘",
+        "as_of": got.get("as_of") or "", "price": None,
+        "forecasts": [], "forecast_table": rows, "drivers_by_h": {},
+        "factors_all": rows, "factor_stats": {},
+        "market": market, "market_global": _clean_global_market(market),
+        "is_fund": False, "scope": scope,
+        "detail": got.get("detail") or "",
+        "meta_errors": [], "meta_sources": {}, "notes": [got.get("detail") or ""],
+        "charts": {}, "stage": {}, "snapshot": {}, "valuation": {},
+        "capital_brief": {}, "sentiment": {}, "macro": {}, "seasonality": {},
+        "theory": {}, "news": [], "fund": {}, "intent_series": [],
+        "main_intent": {}, "volatility": {}, "stages": [],
+        "learning_report": {}, "learning": {}, "recorded": {},
+        "financials_tail": {}, "sector_boards": [],
+    }
+
+
+def _render_scope_preview(scope: str) -> None:
+    """未开始分析时，说明当前范围会分析什么、需要什么输入。"""
+    info = {
+        "all": ("综合分析",
+                "将分析 **大盘 → 板块 → 个股(基金)** 三层：",
+                "· 大盘：大周期牛熊 / 中级波段 / 短线结构 / 量价 / 操作技巧\n"
+                "· 板块：宽度与完整度、领涨领跌、20日动量、轮动方向\n"
+                "· 标的：八维因子、8 个周期的涨跌概率与幅度\n"
+                "需要：股票或基金代码"),
+        "market": ("大盘/板块分析",
+                   "分析 **大盘 + 板块**：",
+                   "· 大盘三层结构：大周期 / 中级波段 / 短线结构\n"
+                   "· 量价验证 + 关键位 + 操作纪律与仓位建议\n"
+                   "· 板块轮动：宽度与完整性、领涨领跌、20日动量\n"
+                   "· 大盘指数与板块的**概率预测**\n"
+                   "· 大盘基本面替代物（估值分位/两融/北向）\n"
+                   "**不需要股票代码**，约 15~40 秒\n"),
+        "subject": ("个股/基金分析",
+                    "只分析 **标的自身**：",
+                    "· 八维因子（技术/资金/情绪/宏观/消息/周期/理论/基金专属）\n"
+                    "· 8 个预测周期的涨跌概率、期望幅度、置信区间\n"
+                    "· 不含大盘与板块面板（如需一并看，请选「综合分析」）\n"
+                    "需要：股票或基金代码\n"),
+    }
+    title, head, body = info.get(scope, info["all"])
+    st.markdown("#### %s" % title)
+    st.markdown(head)
+    st.markdown(body)
+
+
 @st.cache_data(show_spinner=False, ttl=1800, max_entries=24)
 def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
-                    self_learning: bool = True, _progress_cb=None) -> dict:
+                    self_learning: bool = True) -> dict:
     """执行一次完整分析并返回可序列化的结果字典。
 
     ``_progress_cb`` 前面的下划线是 **Streamlit 的约定**：告诉 cache_data
@@ -181,14 +314,8 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
     stages: list = []
 
     def _progress(stage: str, pct: float) -> None:
+        # 只做记录，绝不碰 UI（本函数被 @st.cache_data 装饰）
         stages.append((stage, pct))
-        # 把进度实时透传给界面（Streamlit 首次运行会真正更新进度条；
-        # 命中缓存时不会再回调，界面直接显示完成）
-        if _progress_cb is not None:
-            try:
-                _progress_cb(stage, pct)
-            except Exception:  # noqa: BLE001
-                pass
 
     result = predictor.run(progress=_progress)
     bundle = result.bundle
@@ -224,6 +351,10 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
         # 所以必须单独导出全量，否则八维明细里会缺 KDJ 这类因子）
         "factors_all": [_factor_row(f) for f in (getattr(bundle, "factors", []) or [])],
         "volatility": (bundle.indicators.get("volatility") if bundle is not None else {}),
+        "indicators": _deep_clean(
+            {k: v for k, v in (bundle.indicators or {}).items()
+             if k in ("volatility", "keypoint", "self_learning")}
+            if bundle is not None else {}, depth=9),
         "snapshot": _clean_dict(getattr(bundle, "snapshot", {}) or {}),
         "stage": _clean_dict(getattr(bundle, "stage", {}) or {}),
         "valuation": _clean_dict(getattr(bundle, "valuation", {}) or {}),
@@ -237,6 +368,7 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
         "sector_boards": (getattr(bundle, "sentiment", {}) or {}).get("boards_raw") or [],
         # ---- 大盘与外围市场（A股/港股/美股/VIX/A50）----
         "market_global": _clean_global_market(getattr(bundle, "market", {}) or {}),
+        "market": _deep_clean(getattr(bundle, "market", {}) or {}, depth=9),
         # ---- 主力操盘意图 ----
         "main_intent": _clean_dict((getattr(bundle, "capital", {}) or {}).get("main_intent")
                                    or {}, depth=2),
@@ -244,6 +376,9 @@ def cached_analysis(symbol: str, use_ml: bool, demo: bool, days: int,
                           ((getattr(bundle, "capital", {}) or {}).get("intent_series") or [])
                           if isinstance(x, dict)][-30:],
         "stages": stages[-6:],
+        # ---- 场内基金专属（ETF/LOF/封基/REITs）----
+        "fund": _deep_clean(getattr(bundle, "fund", {}) or {}, depth=9),
+        "is_fund": bool((getattr(bundle, "fund", {}) or {}).get("is_fund")),
         # ---- 自我学习 ----
         "learning": _deep_clean(result.meta.get("learning") or {}, depth=9),
         "recorded": _deep_clean(result.meta.get("recorded") or {}, depth=9),
@@ -1163,7 +1298,13 @@ def render_fields(v: dict, *, label_map: dict | None = None,
 def _kv_grid_items(items: list) -> None:
     """底层渲染：把 ``[(标签, 值, 是否缺失)]`` 画成卡片网格。"""
     html = ["<div class='bigprobs'>"]
-    for k, v, missing in items:
+    for k, v, _hint in items:
+        # 第三位只是"该字段允许为空"的提示，**不能**直接当作"缺失"——
+        # 曾经的 bug：大量调用点传 True（本意=可为空），结果值明明有却显示成"—"。
+        # 这里一律按**实际值**判断是否缺失。
+        missing = (v is None
+                   or (isinstance(v, float) and v != v)
+                   or (isinstance(v, str) and not v.strip()))
         cls = "pcard miss" if missing else "pcard"
         val = "—" if missing else _esc(_fmt_value(k, v))
         html.append("<div class='%s'><div class='lbl'>%s</div>"
@@ -1424,7 +1565,10 @@ def _apply_symbol(code: str) -> None:
 
 
 def sidebar() -> dict:
-    st.sidebar.title("个股涨跌概率预测")
+    st.sidebar.title("A股涨跌概率预测")
+    render_freshness(in_sidebar=True)
+    render_macro_manual()          # 手动输入宏观数据（含上交所官方链接）
+    render_ai_config()             # AI 接口配置
     st.sidebar.caption("core v%s ｜ 8 个周期 ｜ 8 大维度因子" % CORE_VERSION)
 
     st.session_state.setdefault("symbol_input", "600519")
@@ -1432,8 +1576,17 @@ def sidebar() -> dict:
     symbol = st.sidebar.text_input("股票代码 / 名称", key="symbol_input",
                                    help="支持 600519、sh600519、000001.SZ、00700.HK、AAPL，"
                                         "也可直接输入中文名或拼音（如 贵州茅台 / maotai）")
+    # 手动触发：点击按钮才开始分析（打开程序时不自动跑）
     if st.sidebar.button("开始分析", type="primary", width="stretch"):
         st.session_state["run_analysis"] = True
+        # 记下"本次启动时的范围"，用于检测范围变化后需要重新确认
+        st.session_state["_ran_scope"] = st.session_state.get("scope_key", "all")
+        st.session_state["_ran_symbol"] = st.session_state.get("symbol_input", "")
+    if st.sidebar.button("清缓存重算", width="stretch",
+                         help="强制忽略缓存、重新联网取数并重算"):
+        st.session_state["run_analysis"] = True
+        st.session_state["_ran_scope"] = st.session_state.get("scope_key", "all")
+        st.session_state["_ran_symbol"] = st.session_state.get("symbol_input", "")
         cached_analysis.clear()
 
     with st.sidebar.expander("常用股票", expanded=False):
@@ -1749,6 +1902,856 @@ def _esc(x) -> str:
     return html.escape(str(x if x is not None else ""))
 
 
+def render_fund(p: dict) -> None:
+    """场内基金专属面板：类型特点、折溢价、跟踪质量、净值表现、规模、持仓。
+
+    为什么基金要单独一套指标：
+      股票看"公司赚钱能力 + 资金炒作"，基金看的是
+       ① 折溢价率（同一只基金有两个价：场内交易价 vs 基金净值）
+       ② 跟踪误差/信息比率（指数基金的本职工作做得好不好）
+       ③ 净值口径的收益与风险（剔除折溢价噪音后的真实表现）
+       ④ 规模与流动性（规模小有清盘风险）
+       ⑤ 申赎状态（申购受限会切断套利机制）
+      个股那套 PE/PB、龙虎榜、股东户数对它基本不适用。
+    """
+    fd = p.get("fund") or {}
+    if not fd.get("is_fund"):
+        return
+    navm = fd.get("nav") or {}
+    trk = fd.get("tracking") or {}
+    prof = fd.get("profile") or {}
+    ftype = fd.get("type") or ""
+
+    st.markdown("**基金类型与识别依据**")
+    _kv_grid_items([
+        ("基金类型", fd.get("type_label") or ftype or "—", False),
+        ("识别依据", fd.get("reason") or "—", False),
+        ("跟踪标的", prof.get("tracking_index") or "—", False),
+        ("基金规模", prof.get("fund_size_text") or "—", False),
+        ("成立日期", str(prof.get("inception") or "—")[:10], False),
+        ("基金管理人", str(prof.get("manager") or "—")[:14], False),
+    ])
+    if fd.get("detail"):
+        st.caption(fd["detail"])
+    if fd.get("focus"):
+        st.markdown("<div class='tip'>%s</div>" % _esc(fd["focus"]),
+                    unsafe_allow_html=True)
+
+    # ---- 折溢价率（基金独有的第一指标）---- #
+    st.markdown("**折溢价率（场内价格相对基金净值）**")
+    prem = navm.get("premium_pct")
+    if prem is None:
+        st.caption(navm.get("detail") or "未取到净值，无法计算折溢价。")
+    else:
+        cls = "up" if prem > 0 else ("down" if prem < 0 else "flat")
+        st.markdown(
+            "<div class='tip'><b>当前折溢价：<span class='%s'>%+.2f%%</span></b>"
+            "　（溢价=场内比净值贵，买入即多付钱；折价=便宜，安全边际高）</div>"
+            % (cls, prem), unsafe_allow_html=True)
+        _kv_grid_items([
+            ("最新单位净值", navm.get("latest_nav"), False),
+            ("净值日期", navm.get("nav_date"), False),
+            ("累计净值", navm.get("latest_acc_nav"), True),
+            ("当前折溢价%", prem, False),
+            ("近20日折溢价均值%", navm.get("premium_mean_20"), True),
+            ("近20日折溢价标准差%", navm.get("premium_std_20"), True),
+            ("历史分位%", navm.get("premium_percentile"), True),
+            ("近60日最低%", navm.get("premium_min_60"), True),
+            ("近60日最高%", navm.get("premium_max_60"), True),
+        ])
+        ser = navm.get("premium_series") or []
+        if len(ser) >= 10:
+            with st.expander("查看最近 %d 日折溢价序列" % len(ser)):
+                _show_df(pd.DataFrame([{"序号": i + 1, "折溢价%": x}
+                                       for i, x in enumerate(ser)]))
+        st.caption("为什么重要：同一只基金有两个价 —— 场内交易价 与 基金净值。"
+                   "两者偏离越大套利空间越大，而溢价终会向净值收敛。"
+                   "这是 ETF/LOF 独有、股票没有的指标。")
+
+    # ---- 跟踪质量（指数基金的本职工作）---- #
+    te = trk.get("trk_annual_te")
+    st.markdown("**跟踪质量（指数基金跟踪得好不好）**")
+    if te is None:
+        st.caption(trk.get("detail") or "未取到标的指数，跟踪指标未计算。")
+    else:
+        _kv_grid_items([
+            ("年化跟踪误差%", te, False),
+            ("近60日跟踪误差%", trk.get("trk_te_60d"), True),
+            ("累计跟踪偏离%", trk.get("trk_cum_diff"), True),
+            ("与指数相关性", trk.get("trk_corr"), True),
+            ("相对指数Beta", trk.get("trk_beta"), True),
+            ("信息比率", trk.get("trk_info_ratio"), True),
+            ("日跟踪偏离均值%", trk.get("trk_daily_mean"), True),
+            ("样本天数", trk.get("trk_samples"), True),
+        ])
+        st.caption("**跟踪误差越小说明基金越忠实复制了标的指数**（优秀水平约 ≤2%）。"
+                   "信息比率 = 超额收益/跟踪误差：持续为正说明能稳定跑赢标的。"
+                   "相关性接近 1 意味着**预测这只基金本质上就是预测它的标的指数**。")
+
+    # ---- 净值表现与风险（基金口径）---- #
+    st.markdown("**净值表现与风险（基金口径）**")
+    _kv_grid_items([
+        ("近5日净值涨跌%", navm.get("nav_ret_5日"), True),
+        ("近20日净值涨跌%", navm.get("nav_ret_20日"), True),
+        ("近60日净值涨跌%", navm.get("nav_ret_60日"), True),
+        ("近120日净值涨跌%", navm.get("nav_ret_120日"), True),
+        ("年化波动率%", navm.get("nav_vol_annual"), True),
+        ("最大回撤%", navm.get("nav_max_dd"), True),
+        ("年化收益%", navm.get("nav_cagr"), True),
+        ("夏普比率", navm.get("nav_sharpe"), True),
+    ])
+    st.caption("基金的评价应以**净值**为准（而不是场内价格的短期波动）——"
+               "净值剔除了折溢价噪音，反映真实的资产表现。")
+
+    # ---- 申赎状态 ----
+    bs = navm.get("buy_state") or prof.get("buy_state")
+    ss = navm.get("sell_state")
+    if bs or ss:
+        st.markdown("**申赎状态（影响套利机制）**")
+        _kv_grid_items([("申购状态", bs or "—", False),
+                        ("赎回状态", ss or "—", False)])
+        if "暂停" in str(bs) or "限制" in str(bs):
+            st.warning("申购受限会**切断套利机制**，场内价格更容易脱离净值"
+                       "（高溢价可能持续），常见于跨境 QDII 与热门主题基金。")
+
+    # ---- 成分股（持仓）分析：基金的穿透视角 ----
+    ha = fd.get("holdings_analysis") or {}
+    items = ha.get("items") or []
+    st.markdown("**成分股分析（穿透到底层，领先于基金净值）**")
+    if not items:
+        st.caption(ha.get("detail") or "未取到前十大持仓（基金可能尚未披露季报）。")
+    else:
+        if ha.get("detail"):
+            st.caption(ha["detail"])
+        conc = ha.get("concentration") or {}
+        _kv_grid_items([
+            ("成分股加权涨跌%(今日)", ha.get("weighted_ret_1d"), True),
+            ("成分股加权涨跌%(近5日)", ha.get("weighted_ret_5d"), True),
+            ("成分股加权涨跌%(近20日)", ha.get("weighted_ret_20d"), True),
+            ("成分股上涨占比%", ha.get("breadth_up_pct"), True),
+            ("成分股站上MA20占比%", ha.get("breadth_ma20_pct"), True),
+            ("第一大持仓占比%", conc.get("top1"), True),
+            ("前五大合计%", conc.get("top5"), True),
+            ("前十大合计%", conc.get("top10"), True),
+        ])
+        if ha.get("top_heavy"):
+            st.warning("前五大持仓合计 %.1f%%，集中度较高 —— "
+                       "基金涨跌基本由这几只决定，等于间接买入它们。"
+                       % (conc.get("top5") or 0))
+        st.markdown("**前十大持仓明细**")
+        _show_df(pd.DataFrame([{
+            "代码": it.get("code"), "名称": it.get("name"),
+            "占净值%": it.get("ratio"),
+            "今日%": it.get("ret_1d"), "近5日%": it.get("ret_5d"),
+            "近20日%": it.get("ret_20d"),
+            "站上MA20": ("是" if it.get("above_ma20") else "否")
+                            if it.get("above_ma20") is not None else "—",
+            "一年位置%": it.get("pos_pct"),
+        } for it in items]))
+        st.caption("为什么看成分股：基金净值**每天只在收盘后更新一次**，"
+                   "而成分股是实时交易的——它们的强弱领先于净值表现。"
+                   "集中度高时，基金涨跌几乎等于这几只股票的加权走势。")
+
+
+def _render_forecast_table(idx_fc: dict, title: str) -> None:
+    """把"代码 → 8 周期预测"渲染成表格。"""
+    if not idx_fc:
+        return
+    rows = []
+    for key, series in idx_fc.items():
+        if not series:
+            continue
+        row = {"指数/板块": _FKIND.get(key, key)}
+        for x in series:
+            row[x["label"]] = "%.0f%%" % (x["p_up"] * 100)
+        d5 = next((x for x in series if x["horizon"] == "d5"), None)
+        if d5:
+            row["近5日期望%"] = "%+.2f%%" % d5["exp_return"]
+        row["置信度"] = "%.0f%%" % (series[0]["confidence"] * 100)
+        rows.append(row)
+    if rows:
+        st.markdown("**%s**" % title)
+        _show_df(pd.DataFrame(rows))
+        st.caption("概率含义：到该周期末，价格相对**当前价**上涨的概率。"
+                   "指数/板块缺少基本面维度，因子数少于个股，"
+                   "因此置信度天然偏低——这是诚实的表现，不是缺陷。")
+
+
+def render_ai_config() -> None:
+    """侧边栏：AI 接口配置（Key / 地址 / 模型），存本地文件。"""
+    try:
+        from core import ai_analyst as AI
+    except Exception:  # noqa: BLE001
+        return
+    stt = AI.status()
+    label = ("AI 设置（%s）" % ("已启用" if stt.get("available") else "未配置"))
+    with st.sidebar.expander(label, expanded=not stt.get("available")):
+        if stt.get("available"):
+            st.success("当前：%s ｜ 来源 %s"
+                       % (stt.get("key_masked"), stt.get("source") or "—"))
+        else:
+            st.caption("填入 API Key 后即可在「大盘/板块分析」里使用 AI 复核。"
+                       "**Key 只存在本机** `data/ai_config.json`（已 gitignore），"
+                       "不会上传到任何地方。")
+        f = AI.load_config()
+        k = st.text_input("API Key", value="", key="ai_cfg_key",
+                          type="password",
+                          placeholder=("已保存：%s（留空则不修改）" % stt.get("key_masked"))
+                          if stt.get("available") else "sk-…")
+        c1, c2 = st.columns(2)
+        with c1:
+            base = st.text_input("接口地址", value=str(f.get("base") or
+                                                      "https://api.deepseek.com"),
+                                 key="ai_cfg_base")
+        with c2:
+            model = st.text_input("模型", value=str(f.get("model") or "deepseek-chat"),
+                                  key="ai_cfg_model")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("保存", key="ai_cfg_save", width="stretch"):
+                new = dict(f)
+                new["base"] = (base or "").strip() or "https://api.deepseek.com"
+                new["model"] = (model or "").strip() or "deepseek-chat"
+                if (k or "").strip():
+                    new["key"] = k.strip()
+                if not new.get("key"):
+                    st.error("还没有 Key：请在上面填入 API Key。")
+                elif AI.save_config(new):
+                    st.success("已保存，立即生效")
+                    st.rerun()
+                else:
+                    st.error("保存失败（检查 data/ 目录写入权限）")
+        with b2:
+            if st.button("清除 Key", key="ai_cfg_clear", width="stretch"):
+                n2 = dict(f)
+                n2.pop("key", None)
+                AI.save_config(n2)
+                st.info("已清除本地 Key")
+                st.rerun()
+        st.caption("配置文件：%s" % (stt.get("config_file") or "—"))
+        st.caption("也可用环境变量 `STOCKAI_AI_KEY`（优先级高于界面配置）。")
+
+
+def render_macro_manual() -> None:
+    """侧边栏：手动输入宏观数据（自动源过期时的兜底）。"""
+    try:
+        from core import macro_source as MO
+
+        cur = MO.load_manual()
+    except Exception:  # noqa: BLE001
+        return
+    with st.sidebar.expander("手动输入宏观数据（可选）", expanded=False):
+        st.caption("自动源（东财/akshare）过期时，可在此填最新值。"
+                   "**日期必填**，新鲜度校验会据此判断是否可用于分析。")
+        import datetime as _dt
+
+        # 官方数据源直达（点击即打开网页查数）
+        st.markdown(
+            "**官方数据源直达：**\n"
+            "- CPI / PPI / PMI → "
+            "[国家统计局 data.stats.gov.cn ↗](https://data.stats.gov.cn/)\n"
+            "- M2 / LPR → "
+            "[中国人民银行 www.pbc.gov.cn ↗](http://www.pbc.gov.cn/)\n"
+            "- 沪市A股新开户 → "
+            "[上交所统计月报 ↗]("
+            "https://www.sse.com.cn/aboutus/publication/monthly/investor/)",
+            unsafe_allow_html=False)
+        st.caption("**怎么查**：统计局→数据查询→月度数据；央行→货币政策→统计数据。"
+                   "统计局与央行一般次月中旬披露上月数据。\n"
+                   "**单位**：CPI/PPI 填累计同比（%，如 2.3）；PMI 填数值（如 50.1）；"
+                   "M2 填同比（%）；LPR 填当期值（%）；沪市新开户填万户。\n"
+                   "填「数值 + 日期」后保存，新鲜度校验会认可（月频 70 天内有效）。")
+        keys = [("cpi", "CPI累计同比%"), ("ppi", "PPI累计同比%"), ("pmi", "PMI"),
+                ("m2", "M2同比%"), ("lpr", "LPR%"),
+                ("sse_new_accounts", "沪市A股新开户(万户)")]
+        newd = dict(cur)
+        for k, lab in keys:
+            old = cur.get(k) or {}
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                v = st.text_input(lab, value=(str(old.get("value")) if old.get("value") is not None else ""),
+                                 key="mm_v_%s" % k)
+            with c2:
+                dd = st.text_input("日期", value=(old.get("date") or ""),
+                                   key="mm_d_%s" % k, placeholder="2026-09-01")
+            if str(v).strip() == "":
+                newd.pop(k, None)
+            else:
+                try:
+                    newd[k] = {"value": float(str(v).strip()),
+                               "date": str(dd).strip(),
+                               "note": "手动输入"}
+                except Exception:  # noqa: BLE001
+                    st.warning("%s 的值不是数字，已忽略" % lab)
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("保存", key="mm_save", width="stretch"):
+                if MO.save_manual(newd):
+                    st.success("已保存到 %s" % MO.MANUAL_FILE)
+                    st.rerun()
+                else:
+                    st.error("保存失败（检查目录权限）")
+        with b2:
+            if st.button("清空", key="mm_clear", width="stretch"):
+                MO.save_manual({})
+                st.info("已清空手动数据")
+                st.rerun()
+        st.caption("保存位置：%s" % getattr(MO, "MANUAL_FILE", "—"))
+
+
+def render_freshness(in_sidebar: bool = False) -> None:
+    """数据新鲜度健康面板（通用机制 core/freshness.py）。
+
+    ``in_sidebar=True`` 时渲染到侧边栏——这样**一进页面就能看到**
+    数据健康状态，而不必先跑一次分析。
+    """
+    try:
+        from core import freshness as FR
+
+        snap = FR.snapshot()
+    except Exception:  # noqa: BLE001
+        return
+    items = snap.get("items") or {}
+    box = st.sidebar if in_sidebar else st
+    if not items:
+        if in_sidebar:
+            box.caption("数据新鲜度：尚未校验（分析后显示）")
+        return
+    with box.expander("数据新鲜度自检（%d 项已校验，%d 项异常）"
+                      % (snap.get("checked", 0), snap.get("bad", 0)),
+                      expanded=False):
+        box.caption("所有外部数据源都会校验最新日期。过期的数据**不参与计算**，"
+                   "只在下方列出——宁可少一个指标，不用旧数据充数。")
+        rows = []
+        for name, r in sorted(items.items(),
+                              key=lambda kv: (kv[1].get("status") != "fresh",
+                                              kv[0])):
+            rows.append({
+                "数据源": name,
+                "最新日期": r.get("date") or "—",
+                "距今(天)": r.get("age_days"),
+                "上限(天)": r.get("limit"),
+                "状态": {"fresh": "新鲜", "stale": "已过期",
+                         "unknown": "无法校验"}.get(r.get("status"), "—"),
+                "说明": r.get("note") or "",
+            })
+        _show_df(pd.DataFrame(rows))
+
+
+def render_ai_review(p: dict) -> None:
+    """AI 复核：让大模型检查程序结论的矛盾与缺口。
+
+    定位：AI 只做**文字复核**，不产生任何进入模型的数字。
+    """
+    try:
+        from core import ai_analyst as AI
+    except Exception:  # noqa: BLE001
+        return
+    stt = AI.status()
+    st.markdown("### AI 复核（交叉检验）")
+    if not stt.get("available"):
+        st.info("未启用 AI 复核。%s。\n\n"
+                "**做法**：设置环境变量 `STOCKAI_AI_KEY` 后重启程序即可。"
+                "可选 `STOCKAI_AI_BASE`（默认 api.deepseek.com）、"
+                "`STOCKAI_AI_MODEL`（默认 deepseek-chat）。\n\n"
+                "**定位说明**：AI 只做文字复核（指出矛盾、补充语境、列出缺口），"
+                "**不产生任何进入打分模型的数字**——避免大模型幻觉污染定量结论。"
+                % stt.get("detail"))
+        return
+    st.caption("已启用：%s ｜ %s ｜ 只做文字复核，**不产生进入模型的数字**"
+               % (stt.get("model"), stt.get("base")))
+    st.caption("三个入口深度递增：结论复核（看矛盾）→ 逐条评因子（看合理性）"
+               "→ 历史类比（看相似时期的后续）。")
+
+    # 核对对象：大盘 / 板块 / 个股基金（按可用数据自动预选）
+    # 只要有板块轮动数据就允许核对板块——不必等板块概率预测
+    # （个股分析时通常没有 board_forecasts，但 rotation 仍有宽度/强弱可核对）
+    _mk = p.get("market") or {}
+    _has_board = bool((_mk.get("board_forecasts")) or
+                      (_mk.get("rotation") or {}).get("board_count"))
+    _has_subj = bool(p.get("forecasts"))
+    _opts = ["大盘"] + (["板块"] if _has_board else []) + \
+            (["个股/基金"] if _has_subj else [])
+    _tmap = {"大盘": "market", "板块": "board", "个股/基金": "subject"}
+    _cur = st.session_state.get("ai_target", _opts[0])
+    if _cur not in _opts:
+        _cur = _opts[0]
+    tgt_cn = st.radio("核对对象", _opts, index=_opts.index(_cur),
+                      horizontal=True, key="ai_target")
+    target = _tmap.get(tgt_cn or "大盘", "market")
+    if target == "market":
+        st.caption("核对大盘：结论自洽性、四维评分矛盾、概率的可信度。")
+    elif target == "board":
+        st.caption("核对板块：概率与当日涨跌是否矛盾、宽度是否失真、"
+                   "只测最强最弱两端的抽样偏差。")
+    else:
+        st.caption("核对个股/基金：八周期概率自洽性、因子重复计入、"
+                   "置信度是否虚高、期望与区间是否匹配。")
+    q = st.text_input("可选：向 AI 追问一个具体问题（仅①复核结论生效）",
+                      key="ai_q",
+                      placeholder="例如：四维评分里量价偏多但位置极弱，哪个更可信？")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        b1 = st.button("① 复核结论", key="ai_run1", width="stretch",
+                       type="primary")
+    with c2:
+        b2 = st.button("② 逐条评因子", key="ai_run2", width="stretch")
+    with c3:
+        b3 = st.button("③ 历史类比", key="ai_run3", width="stretch")
+
+    if b1:
+        with st.spinner("AI 复核中…（约 10~40 秒）"):
+            st.session_state["ai_result"] = AI.review_target(
+                p, target, extra_question=q or "")
+    if b2:
+        with st.spinner("AI 逐条评价因子中…（约 15~50 秒，因子多时更久）"):
+            st.session_state["ai_result"] = AI.review_factors(p)
+    if b3:
+        with st.spinner("AI 检索历史相似时期中…（约 15~50 秒）"):
+            st.session_state["ai_result"] = AI.review_analog(p)
+
+    r = st.session_state.get("ai_result") or {}
+    if not r:
+        st.caption("点上方任一按钮开始。**底线**：AI 输出一律不进入概率模型，"
+                   "只作人工对照参考。")
+        return
+    if not r.get("ok"):
+        st.error("AI 调用失败：%s" % (r.get("error") or "未知错误"))
+        return
+    st.success("完成（%s ｜ 耗时 %.1f 秒%s）"
+               % (r.get("model") or "—", (r.get("elapsed_ms") or 0) / 1000.0,
+                  " ｜ 来自缓存" if r.get("cached") else ""))
+    st.markdown(r.get("text") or "")
+    with st.expander("查看发给 AI 的事实清单（核对他有没有编数据）"):
+        st.code(r.get("facts") or "", language="markdown")
+        st.caption("**这是关键**：AI 只能基于上面这份清单推理。"
+                   "若它的回答里出现清单之外的数字或因子，那就是幻觉，不要采信。")
+    st.warning("以上为 AI 的**定性参考**，不参与任何概率计算。"
+               "开源模型的金融市场知识存在时效性偏差，"
+               "涉及具体点位/涨跌幅的表述尤其不可靠——本面板的唯一可信数字"
+               "在它上方的定量面板里。")
+
+
+def render_deep_phase(p: dict) -> None:
+    """深度阶段判定：四维评分 + 拉升/回调分级（道氏+波浪）。"""
+    mk = p.get("market") or {}
+    # deep 挂在 structure 之下（analyze_market_structure 的输出里），
+    # 也兼容直接放在 market 下的情况
+    deep = (mk.get("structure") or {}).get("deep") or mk.get("deep") or {}
+    if not deep:
+        return
+    comp = deep.get("compose") or {}
+    fine = deep.get("fine") or {}
+    dims = comp.get("dims") or {}
+    st.markdown("### 深度阶段判定（道氏 + 波浪 + 四维评分）")
+    st.caption("不局限于六波段——用**四维独立评分**判断，并区分拉升高度与回调深度。"
+               "道氏原则：主要趋势由结构定义，短期反弹不能改变主要趋势判定。")
+    _kv_grid_items([
+        ("综合评分", ("%.0f/100" % (comp.get("total", 0) * 100))
+         if comp else None, False),
+        ("倾向", comp.get("lean"), False),
+        ("置信度%", (comp.get("confidence") or 0) * 100, False),
+        ("四维一致度%", (comp.get("agreement") or 0) * 100, False),
+        ("核心驱动", (dims.get("driver") or 0) * 100, False),
+        ("结构形态", (dims.get("structure") or 0) * 100, False),
+        ("关键位置", (dims.get("position") or 0) * 100, False),
+        ("量价关系", (dims.get("volume") or 0) * 100, False),
+    ])
+    if comp.get("gate"):
+        st.warning("道氏闸门：%s" % comp["gate"])
+    if fine.get("stage"):
+        st.markdown("**阶段**：%s　｜　**浪型**：%s" % (fine["stage"],
+                                                  fine.get("wave") or "未明"))
+    if fine.get("advice"):
+        st.info("策略提示：%s" % fine["advice"])
+    _vq = (dims.get("volume") or 0) * 100
+    _po = (dims.get("position") or 0) * 100
+    if _vq >= 60 and _po <= 30:
+        st.warning("**为什么量价 %.0f 分偏强、却仍判「%s」**：\n"
+                   "- **量价**只反映短期资金配合（是否放量、量价同向），"
+                   "回答「当下有没有人买」\n"
+                   "- **位置**（%.0f 分）反映价格在区间中的相对高低，"
+                   "回答「买了之后还有多少空间」\n\n"
+                   "短期有人买、但位置极低，通常是**下跌中继的反抽**，"
+                   "不是趋势反转。判断趋势性质要看**位置与结构**，"
+                   "不能只看量能——这正是道氏「主要趋势由结构定义」的含义。"
+                   % (_vq, fine.get("stage") or "—", _po))
+    for k, lab in (("driver", "核心驱动"), ("structure", "结构形态"),
+                   ("position", "关键位置"), ("volume", "量价关系")):
+        d = deep.get(k) or {}
+        if d.get("detail"):
+            st.caption("**%s**：%s" % (lab, d["detail"]))
+    sw = deep.get("swing") or {}
+    if sw.get("detail"):
+        st.caption("摆动点结构：%s" % sw["detail"])
+
+
+def render_macro_env(p: dict) -> None:
+    """宏观/政治/社会/政策环境。"""
+    mk = p.get("market") or {}
+    env = mk.get("macro_env") or {}
+    if not env:
+        return
+    st.markdown("### 宏观/政策环境")
+    st.caption("A股是「政策+流动性晴雨表」。有数据可依的部分打分，"
+               "**无法量化的（政治/社会/地缘）列成核查清单，不编造分数**。")
+    ind = env.get("indicators") or {}
+    if ind:
+        _LBL = {"pmi": "PMI", "cpi": "CPI累计同比%", "ppi": "PPI累计同比%",
+                "m2": "M2同比%", "lpr": "LPR(1年)%",
+                "sse_new_accounts": "沪市A股新开户(万户)"}
+        _kv_grid_items([
+            (_LBL.get(k, k), (ind.get(k) or {}).get("value"), True)
+            for k in ("pmi", "cpi", "ppi", "m2", "lpr",
+                      "sse_new_accounts") if k in ind
+        ])
+        # 口径表：这个数字到底是什么，一眼可核对
+        _rows = []
+        for k in ("pmi", "cpi", "ppi", "m2", "lpr", "sse_new_accounts"):
+            d0 = ind.get(k) or {}
+            if d0.get("value") is None:
+                continue
+            _rows.append({
+                "指标": _LBL.get(k, k),
+                "数值": d0.get("value"),
+                "数据日期": d0.get("date") or "—",
+                "出处": d0.get("source") or "—",
+                "口径": d0.get("caliber") or "—",
+                "字段与换算": d0.get("caliber_field") or "—",
+                "当月同比": (("%+.2f%%" % d0["mom_same"])
+                             if d0.get("mom_same") is not None else "—"),
+            })
+        if _rows:
+            st.markdown("**指标口径核对表**（口径不符时结论会整体失真，请抽查）")
+            _show_df(pd.DataFrame(_rows))
+    for k, lab in (("economy", "经济基本面"), ("policy", "政策/流动性")):
+        d = env.get(k) or {}
+        if d.get("score") is not None:
+            st.markdown("**%s：%.0f/100**" % (lab, d["score"] * 100))
+            if d.get("detail"):
+                st.caption(d["detail"])
+    ck = env.get("checklist") or []
+    if ck:
+        with st.expander("人工核查清单（无法自动量化的因素）"):
+            for name, desc in ck:
+                st.markdown("**%s**：%s" % (_esc(name), _esc(desc)))
+
+
+def render_market_drivers(p: dict) -> None:
+    """涨跌主要动能对象及异动意图。"""
+    mk = p.get("market") or {}
+    drv = mk.get("drivers") or {}
+    if not drv or not drv.get("items"):
+        return
+    st.markdown("### 涨跌主要动能对象与异动意图")
+    st.caption("指数涨跌不等于普涨普跌——往往由少数权重/主线决定。"
+               "识别「谁在推动」比「涨了多少」更重要。")
+    st.caption("**口径**：成交额加权涨幅 = 板块涨跌幅 × 该板块成交额占全市场比重 ÷ 100。"
+               "它是「按成交额加权的涨跌幅」，**不是**对指数点位的真实贡献"
+               "（真实贡献需用市值权重，程序暂无全市场市值数据）。"
+               "该值越大说明「该板块对当日市场整体的拉动越强」。")
+    rows = []
+    for it in drv["items"]:
+        rows.append({
+            "板块": it.get("name"),
+            "涨跌幅%": it.get("pct"),
+            "成交占比%": it.get("share"),
+            "成交额加权涨幅%": it.get("contrib"),
+            "板块内宽度%": it.get("breadth"),
+            "净流入(亿)": it.get("net_inflow"),
+            "领涨股": it.get("leader") or "—",
+        })
+    if rows:
+        _show_df(pd.DataFrame(rows))
+    if drv.get("intent"):
+        st.markdown("**异动意图：%s**" % drv["intent"])
+    if drv.get("detail"):
+        st.caption(drv["detail"])
+
+
+def render_market_fundamental(p: dict) -> None:
+    """大盘"基本面替代物"：指数估值/两融/北向/开户数。"""
+    mk = p.get("market") or {}
+    mf = mk.get("market_fundamental") or {}
+    if not mf:
+        return
+    st.markdown("### 大盘基本面替代物")
+    st.caption("指数没有 PE/PB、营收、业绩预告。这四个是 A股大盘最实用的"
+               "替代指标，也是「政策+流动性晴雨表」的具体观测项。")
+    pe = mf.get("pe") or {}
+    mg = mf.get("margin") or {}
+    nt = mf.get("north") or {}
+    ac = mf.get("accounts") or {}
+    _kv_grid_items([
+        ("指数PE", pe.get("pe"), True),
+        ("PE历史分位%", pe.get("percentile"), True),
+        ("两融余额(亿)", mg.get("balance"), True),
+        ("两融近20日变化%", mg.get("change_20d_pct"), True),
+        ("北向近5日(亿)", nt.get("sum_5d"), True),
+        ("北向近20日(亿)", nt.get("sum_20d"), True),
+        ("北向20日净买天数", nt.get("positive_days_20"), True),
+        ("新增投资者", ac.get("latest"), True),
+        ("开户数分位%", ac.get("percentile"), True),
+    ])
+    for label, d in (("指数估值", pe), ("两融余额", mg),
+                     ("北向资金", nt), ("新增开户数", ac)):
+        if d.get("detail"):
+            prefix = "⚠️ " if d.get("stale") else ""
+            st.caption("%s**%s**：%s" % (prefix, label, d["detail"]))
+    if mf.get("stale"):
+        st.warning("以下数据源超过新鲜度上限，已**不参与预测**（不作为当前信号）：%s"
+                   % "、".join(mf["stale"]))
+
+
+def render_market_forecast(p: dict) -> None:
+    """大盘指数概率预测。"""
+    mk = p.get("market") or {}
+    idx_fc = mk.get("index_forecasts") or {}
+    if not idx_fc:
+        return
+    st.markdown("### 大盘指数概率预测")
+    st.caption("对主要指数分别给出 8 个周期的上涨概率与期望幅度。"
+               "指数间相互印证时结论更可靠。")
+    _render_forecast_table(idx_fc, "各指数上涨概率")
+
+
+def render_board_forecast(p: dict) -> None:
+    """板块概率预测。"""
+    mk = p.get("market") or {}
+    bd = mk.get("board_forecasts") or []
+    if not bd:
+        return
+    st.markdown("### 板块概率预测")
+    src = (mk.get("forecast_source") or {}).get("boards") or ""
+    if src:
+        st.caption("数据源：%s。" % src)
+    rows = []
+    for b in bd:
+        fs = b.get("forecasts") or []
+        if not fs:
+            continue
+        d = {x["horizon"]: x for x in fs}
+        rows.append({
+            "板块": b.get("name"),
+            "今日%": "%+.2f%%" % (b.get("pct") or 0),
+            "上涨家数": b.get("up"), "下跌家数": b.get("down"),
+            "净流入(亿)": b.get("net_inflow"),
+            "1日涨概率": ("%.0f%%" % (d["d1"]["p_up"] * 100)) if "d1" in d else "—",
+            "5日涨概率": ("%.0f%%" % (d["d5"]["p_up"] * 100)) if "d5" in d else "—",
+            "20日涨概率": ("%.0f%%" % (d["d20"]["p_up"] * 100)) if "d20" in d else "—",
+            "5日期望%": ("%+.2f%%" % d["d5"]["exp_return"]) if "d5" in d else "—",
+            "置信度": "%.0f%%" % (fs[0]["confidence"] * 100),
+        })
+    if rows:
+        _show_df(pd.DataFrame(rows))
+        st.caption("说明：只对**当日最强与最弱**的板块做预测（真正需要判断"
+                   "「还能不能追」「能不能抄」的两端）。板块缺少基本面维度，"
+                   "置信度普遍偏低。")
+    miss = [b for b in bd if not b.get("forecasts")]
+    if miss:
+        st.caption("以下板块因历史数据不足未给预测：%s"
+                   % "、".join(b.get("name") or "" for b in miss))
+
+
+#: 指数 key → 中文（用于预测表首列）
+_FKIND = {"sh": "上证指数", "sz": "深证成指", "cyb": "创业板指",
+          "hs300": "沪深300", "zz500": "中证500", "kc50": "科创50"}
+
+
+def render_market_panel(p: dict) -> None:
+    """【大盘分析】仅大盘：三层嵌套 + 量价验证 + 关键位置 + 操作技巧。"""
+    mk = p.get("market") or {}
+    mst = mk.get("structure") or {}
+    rot = mk.get("rotation") or {}
+    ov = mk.get("board_overview") or {}
+    if not st and not rot:
+        return
+    regime = mst.get("regime") or {}
+    phase = mst.get("phase") or {}
+    swing = mst.get("swing") or {}
+    vp = mst.get("volume_price") or {}
+    lv = mst.get("levels") or {}
+    disc = mst.get("discipline") or {}
+
+    st.markdown("### 大盘走势：三层嵌套")
+    st.markdown(
+        "<div class='tip'>A股大盘不是随机波动，而是「大周期牛熊 + 中级行情 + 短线波段」"
+        "三层嵌套，每一层都有可观察的规律。**掌握这套框架，比天天猜涨跌有用得多**。<br>"
+        "个股涨跌很大一部分来自系统性（大盘）与行业性（板块）因素，"
+        "跳过前两层直接看个股，很容易把「大盘带起来的」当成「个股走强」。</div>",
+        unsafe_allow_html=True)
+
+    # ---- 三层卡片 ---- #
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**① 最上层：大周期**")
+        st.markdown("**%s**" % _esc(regime.get("regime") or "—"))
+        st.caption("距低点 %+.1f%%｜距高点 %+.1f%%" % (
+            regime.get("from_low_pct") or 0, regime.get("from_high_pct") or 0))
+        _rg = str(regime.get("regime") or "")
+        _ph = str(phase.get("label") or "")
+        if "牛" in _rg and "熊" in _ph:
+            st.info("**「%s + %s」不矛盾**：两者级别不同——\n"
+                    "- 大周期（5 年）：距 5 年低点还有 %s%%，属牛市框架\n"
+                    "- 中级波段（月/季）：当前在出清/回调段\n\n"
+                    "即「**牛市中的中级调整**」。大周期的含义是「不必恐慌」，"
+                    "中级波段的含义是「不必急于抄底」。"
+                    % (_rg, _ph, regime.get("from_low_pct")))
+    with c2:
+        st.markdown("**② 中间层：中级波段**")
+        _plab = phase.get("label_ctx") or phase.get("label") or "—"
+        if phase.get("label_uncertain"):
+            _plab = "%s⚠️待确认" % _plab
+        st.markdown("**%s**" % _esc(_plab))
+        if phase.get("label_uncertain"):
+            st.caption("⚠️ 置信度低于 40%%，此档位仅供参考，"
+                       "不宜作为方向依据（应等闸门条件改善后再定档）。")
+        st.caption("置信度 %.0f%%｜次优：%s" % (
+            (phase.get("confidence") or 0) * 100, phase.get("rivals") or "—"))
+    with c3:
+        st.markdown("**③ 最细层：短线结构**")
+        st.markdown("**%s**" % _esc(swing.get("structure") or "—"))
+        st.caption("高点%s、低点%s" % (
+            swing.get("high_trend") or "—", swing.get("low_trend") or "—"))
+
+    # ---- 详细说明 ---- #
+    if regime.get("detail"):
+        st.markdown("**大周期判定依据**")
+        st.caption(regime["detail"])
+    if phase.get("traits"):
+        st.markdown("**当前波段特征**")
+        st.caption("%s。观察信号：%s" % (phase.get("traits"), phase.get("signals")))
+    if vp.get("state"):
+        st.markdown("**量价验证（真假波段识别器）**")
+        _kv_grid_items([
+            ("量价状态", vp.get("state"), False),
+            ("量比(5/20日)", vp.get("vol_ratio"), False),
+            ("一年区间位置%", vp.get("position_pct"), False),
+            ("近5日涨跌%", vp.get("ret5_pct"), False),
+        ])
+        st.caption(vp.get("detail") or "")
+
+    # ---- 关键位置 ---- #
+    if lv.get("current"):
+        st.markdown("**关键观察位**")
+        _kv_grid_items([
+            ("当前", lv.get("current"), False),
+            ("支撑1", lv.get("support_1"), False),
+            ("支撑2", lv.get("support_2"), True),
+            ("压力1", lv.get("resistance_1"), False),
+            ("压力2", lv.get("resistance_2"), True),
+            ("MA20", lv.get("ma20"), False),
+            ("MA60", lv.get("ma60"), False),
+            ("MA250", lv.get("ma250"), False),
+            ("一年高点", lv.get("year_high"), False),
+            ("一年低点", lv.get("year_low"), False),
+        ])
+
+    # ---- 操作技巧（重点）---- #
+    st.markdown("### 操作技巧提示")
+    if disc.get("position_advice"):
+        st.markdown("<div class='tip'><b>%s</b></div>" % _esc(
+            disc["position_advice"]), unsafe_allow_html=True)
+    for label, key in (("进场", "entry"), ("离场", "exit"), ("禁忌", "avoid")):
+        if disc.get(key):
+            st.markdown("**%s**：%s" % (label, _esc(disc[key])))
+    if phase.get("play"):
+        st.markdown("**本波段操作要点**：%s" % _esc(phase["play"]))
+
+    # ---- 大盘指数概览 ---- #
+    rows = ov.get("rows") or []
+    if rows:
+        st.markdown("### 主要指数概览")
+        _show_df(pd.DataFrame([{
+            "指数": r.get("name"), "收盘": _r(r.get("close")),
+            "近1日%": _r(r.get("ret_1d")), "近5日%": _r(r.get("ret_5d")),
+            "近20日%": _r(r.get("ret_20d")),
+            "一年位置%": _r(r.get("pos_pct")),
+            "MA20": "站上" if r.get("above_ma20") else "跌破",
+            "MA60": "站上" if r.get("above_ma60") else "跌破",
+        } for r in rows]))
+
+    # ---- 深度判定 / 环境 / 动能 / 替代物 / 预测 ---- #
+    # （数据新鲜度面板在侧边栏，见 main() 开头）
+    render_deep_phase(p)
+    render_market_drivers(p)
+    render_macro_env(p)
+    render_market_fundamental(p)
+    render_market_forecast(p)
+    render_ai_review(p)
+
+    # ---- A股独有规律 + 量价口诀（知识卡）---- #
+    traits = mst.get("traits") or []
+    if traits:
+        with st.expander("A股独有的五条规律（判断行情性质用）"):
+            for name, desc in traits:
+                st.markdown("**%s**：%s" % (_esc(name), _esc(desc)))
+    rules = mst.get("vp_rules") or []
+    if rules:
+        with st.expander("量价验证口诀（真假波段识别器）"):
+            for name, direction, meaning in rules:
+                st.markdown("- **%s** → %s（%s）"
+                            % (_esc(name), _esc(meaning),
+                               "偏多" if direction > 0 else "偏空"))
+
+
+def render_board_panel(p: dict) -> None:
+    """【板块分析】仅板块：宽度、领涨领跌、动量、轮动阶段匹配。"""
+    mk = p.get("market") or {}
+    phase = (mk.get("structure") or {}).get("phase") or {}
+    rot = mk.get("rotation") or {}
+    if not rot:
+        st.info("本次未取到板块数据。板块接口（东财 push2）偶尔不稳，"
+                "可稍后重试或点击左侧「清空数据缓存」。")
+        return
+    st.markdown("### 板块情况与轮动")
+    if rot.get("detail"):
+        st.caption(rot["detail"])
+    q = rot.get("breadth_quality")
+    if q and not rot.get("breadth_reliable"):
+        st.warning("板块数据完整性：%s。板块宽度可能偏差，仅供参考。" % q)
+    _kv_grid_items([
+        ("板块数量", rot.get("board_count"), True),
+        ("上涨板块数", (round((rot.get("board_breadth_pct") or 0) / 100.0
+                          * (rot.get("board_count") or 0)) or None), True),
+        ("板块宽度%", rot.get("board_breadth_pct"), True),
+        ("平均涨幅%", rot.get("board_avg_pct"), True),
+        ("中位涨幅%", rot.get("board_median_pct"), True),
+        ("数据完整性", rot.get("breadth_quality") or "—", False),
+    ])
+    top = rot.get("top") or []
+    if top:
+        st.markdown("**当日领涨板块**")
+        _show_df(pd.DataFrame([{
+            "板块": x.get("name"), "涨跌幅%": _r(x.get("pct")),
+            "换手%": _r(x.get("turnover")), "领涨股": x.get("leader") or "—",
+            "近20日%": _r(x.get("ret_20d")),
+        } for x in top[:10]]))
+    bottom = rot.get("bottom") or []
+    if bottom:
+        with st.expander("查看当日领跌板块"):
+            _show_df(pd.DataFrame([{
+                "板块": x.get("name"), "涨跌幅%": _r(x.get("pct")),
+                "换手%": _r(x.get("turnover")),
+            } for x in bottom]))
+    mom = rot.get("momentum_top") or []
+    if mom:
+        st.markdown("**近20日动量最强板块**")
+        _show_df(pd.DataFrame([{"板块": x.get("name"),
+                                "近20日%": _r(x.get("ret_20d"))} for x in mom]))
+    render_board_forecast(p)
+
+    hint = rot.get("rotation_hint") or {}
+    if hint.get("phase_themes"):
+        st.markdown("**按当前波段该关注的方向**")
+        st.caption("当前处于「%s」，历史上该阶段通常领涨：%s（如 %s）。"
+                   "本次领涨中已命中：%s"
+                   % (phase.get("label") or "—", hint.get("phase_themes"),
+                      hint.get("phase_examples"),
+                      "、".join(hint.get("matched") or []) or "暂未命中"))
+
+
+
 def render_dimensions(p: dict) -> None:
     snap = p.get("snapshot") or {}
     stage = p.get("stage") or {}
@@ -1760,12 +2763,25 @@ def render_dimensions(p: dict) -> None:
     th = p.get("theory") or {}
     stats = p.get("factor_stats") or {}
     vol = p.get("volatility") or {}
+    is_fund = bool(p.get("is_fund"))
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
-        ["① 个股特性/阶段", "② 技术面", "③ 基本面", "④ 资金面/主力", "⑤ 情绪/博弈",
-         "⑥ 宏观/行业", "⑦ 消息/事件", "⑧ 周期/季节性", "⑨ 理论模型"])
+    # 场内基金时把"个股特性"换成"基金特性"、"基本面"换成"基金专属"——
+    # 对基金来说 PE/PB、龙虎榜、股东户数没有意义，不能给用户看一堆空值。
+    if is_fund:
+        tab_titles = ["① 基金特性/类型", "② 技术面", "③ 基金专属（折溢价/跟踪）",
+                      "④ 资金面/主力", "⑤ 情绪/博弈",
+                      "⑥ 宏观/行业", "⑦ 消息/事件", "⑧ 周期/季节性", "⑨ 理论模型"]
+    else:
+        tab_titles = ["① 个股特性/阶段", "② 技术面", "③ 基本面", "④ 资金面/主力",
+                      "⑤ 情绪/博弈", "⑥ 宏观/行业", "⑦ 消息/事件",
+                      "⑧ 周期/季节性", "⑨ 理论模型"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(tab_titles)
 
     with tab1:
+        if is_fund:
+            render_fund(p)
+            st.markdown("---")
+            st.markdown("**行情与阶段指标**")
         # 行情快照：直接传原始字段，标签与数字格式由 render_fields 统一处理
         render_fields(snap, label_map={"name": "股票名称", "code": "股票代码",
                                         "trade": "现价", "price": "现价"})
@@ -1807,7 +2823,13 @@ def render_dimensions(p: dict) -> None:
                    "说明它当前既没有金叉/死叉，也没进入超买超卖区，属正常情况。")
 
     with tab3:
-        if val:
+        if is_fund:
+            render_fund(p)
+            st.markdown("---")
+            st.caption("说明：对场内基金，PE/PB、营收增速、龙虎榜、股东户数"
+                       "这些**个股指标并不适用**，因此本页展示基金专属维度。"
+                       "个股那套基本面分析已自动跳过。")
+        if val and not is_fund:
             render_fields(val, label_map={"pe_static": "PE(静态)",
                                            "pe_median_5y": "PE五年中位数",
                                            "pb_median_5y": "PB五年中位数",
@@ -1819,7 +2841,7 @@ def render_dimensions(p: dict) -> None:
             st.warning("未取得估值数据（PE/PB）。可能是实时快照接口不可用，"
                        "可稍后重试或点击左侧「清空数据缓存」。")
         fin = p.get("financials_tail")
-        if fin and any(len(v) for v in fin.values()):
+        if fin and not is_fund and any(len(v) for v in fin.values()):
             st.markdown("**财务摘要（最近若干期）**")
             _show_df(pd.DataFrame(fin))
             st.caption("报告期口径：A 股财报为**年内累计**，"
@@ -2503,16 +3525,52 @@ def main() -> None:
     # 否则页面滚动时标题会被视口顶边裁掉一半，看起来像"显示不全"）
     st.markdown(
         "<div class='hero appbanner'>"
-        "<h1>个股涨跌概率预测模型 V2.0</h1>"
+        "<h1>A股涨跌概率预测模型 V2.0</h1>"
         "<div class='meta'>技术面 · 基本面 · 资金面 · 情绪面 · 宏观 · 消息面 · 周期 · "
         "金融理论　→　未来 1天 / 5天 / 10天 / 20天 / 1个月 / 1个季度 / 半年 / 1年 "
         "的涨跌概率与幅度推断</div>"
         "<div class='byline'>田夫 开发</div>"
         "</div>", unsafe_allow_html=True)
 
+    # ================= 先选分析范围（初始界面即可见）================= #
+    st.markdown("#### 选择分析范围")
+    # 三个范围：大盘与板块**合并**为一个（板块分析本来就需要大盘波段来定位阶段，
+    # 拆成两个反而要跑两遍）。
+    # 用 segmented_control：**直接点名称即选中**，不需要额外的「选择」按钮。
+    _SCOPES = [
+        ("all", "综合分析", "大盘 + 板块 + 个股/基金 全部一并分析"),
+        ("market", "大盘/板块分析", "大盘三层结构 + 板块轮动与概率预测（无需代码）"),
+        ("subject", "个股/基金分析", "只看标的自身的八维与概率预测"),
+    ]
+    _NAME2KEY = {n: k for k, n, _ in _SCOPES}
+    _KEY2NAME = {k: n for k, n, _ in _SCOPES}
+    _KEY2DESC = {k: d for k, _, d in _SCOPES}
+    picked_key = st.session_state.get("scope_key", "all")
+    _labels = [n for _, n, _ in _SCOPES]
+    _cur_label = _KEY2NAME.get(picked_key, _labels[0])
+    try:
+        picked_label = st.segmented_control(
+            "分析范围", _labels, default=_cur_label,
+            key="scope_seg", label_visibility="collapsed")
+    except Exception:                       # 老版本无此组件时兜底
+        picked_label = st.radio("分析范围", _labels, horizontal=True,
+                                label_visibility="collapsed",
+                                index=_labels.index(_cur_label))
+    scope = _NAME2KEY.get(picked_label or "", picked_key)
+    if scope != picked_key:
+        # 换了范围 → 需要重新点「开始分析」（不自动跑）
+        st.session_state["scope_key"] = scope
+        st.session_state["run_analysis"] = False
+    st.caption("当前选择：**%s** ｜ %s"
+               % (_KEY2NAME.get(scope, "综合分析"), _KEY2DESC.get(scope, "")))
+    scope_label = _KEY2NAME.get(scope, "综合分析")
+    need_symbol = scope in ("all", "subject")
+
     sym_raw = (opts["symbol"] or "").strip()
-    if not sym_raw:
-        st.info("请在左侧输入股票代码，例如 `600519`、`000001`、`300750`。")
+    if need_symbol and not sym_raw:
+        st.info("「%s」需要输入股票/基金代码（例如 `600519`、`510300`）。"
+                "若只想看大盘或板块，请选择上方的「大盘分析」或「板块分析」（无需代码）。"
+                % scope_label.split(" ", 1)[-1])
         st.markdown("<div class='risk'>%s</div>" % DISCLAIMER, unsafe_allow_html=True)
         return
 
@@ -2555,39 +3613,98 @@ def main() -> None:
         st.warning("代码解析失败：%s" % exc)
         return
 
-    if not st.session_state.get("run_analysis"):
-        st.info("请在左侧输入代码后点击「开始分析」。")
+    # 只要代码有效且开启了自动分析，就直接进入分析流程
+    # （旧逻辑要求必须点按钮，导致用户打开页面只看到待机提示，以为没功能）
+    # 手动启动：未点击「开始分析」、或范围/代码已变化时，都不自动跑
+    _ran = bool(st.session_state.get("run_analysis"))
+    if _ran:
+        if (st.session_state.get("_ran_scope") != scope
+                or (need_symbol and st.session_state.get("_ran_symbol") != sym_raw)):
+            _ran = False                    # 输入变了 → 需要重新点击
+            st.session_state["run_analysis"] = False
+    if not _ran:
+        st.info("已选择「%s」。确认下方说明与左侧设置后，"
+                "请点击左侧 **开始分析** 按钮启动。"
+                % scope_label)
+        _render_scope_preview(scope)
         st.markdown("<div class='risk'>%s</div>" % DISCLAIMER, unsafe_allow_html=True)
         return
 
-    prog = st.progress(0.0, text="准备中…")
-    _stage_names = {
-        "获取行情数据": "① 获取行情与基本面数据",
-        "八大维度分析": "② 八大维度因子分析（技术/资金/情绪/宏观/消息/周期/理论）",
-        "因子汇总与概率推导": "③ 因子汇总与概率推导",
-        "训练AI模型": "④ 训练 AI 模型",
-        "推导概率": "⑤ 推导各周期概率与幅度",
-        "生成报告": "⑥ 生成报告",
-    }
+    # 动态进度条：分析放到后台线程，主线程轮询刷新。
+    # 这样进度条是**真的在动**，而不是转圈等结束。
+    # 注意：进度容器只是数字，不属于 Streamlit UI，写进线程是合法的；
+    # 缓存函数保持纯粹（不含任何 UI 调用）。
+    if scope == "market":
+        _tip = "正在分析大盘与板块…（首次约 15~40 秒，含板块历史）"
+    else:
+        _tip = "正在分析 %s 的八大维度…（首次约 20~60 秒）" % (sym_raw or "该标的")
 
-    def _on_progress(stage: str, pct: float) -> None:
+    def _job():
+        """后台任务：只算，不碰 UI。"""
         try:
-            label = _stage_names.get(stage, stage)
-            prog.progress(min(max(float(pct), 0.0), 1.0),
-                          text="%s ｜ %.0f%%" % (label, float(pct) * 100))
-        except Exception:  # noqa: BLE001
-            pass
+            if scope == "market":
+                # 合并后的「大盘/板块分析」= 引擎 all（大盘结构 + 板块轮动）
+                out = cached_market_analysis("all", int(opts["days"]))
+                out["scope"] = "market"
+            else:
+                out = cached_analysis(sym_raw, bool(opts["use_ml"]),
+                                      bool(opts["demo"]), int(opts["days"]),
+                                      bool(opts.get("self_learning", True)))
+                out["scope"] = scope
+            _box["payload"] = out
+            _box["tracker"].finish()
+        except Exception as exc:  # noqa: BLE001
+            _box["error"] = exc
+            _box["tracker"].finish(str(exc))
 
     try:
-        _on_progress("获取行情数据", 0.02)
-        payload = cached_analysis(sym_raw, bool(opts["use_ml"]), bool(opts["demo"]),
-                                  int(opts["days"]), bool(opts.get("self_learning", True)),
-                                  _progress_cb=_on_progress)
-        prog.progress(1.0, text="完成")
-        time.sleep(0.15)
-        prog.empty()
+        _box = {"payload": None, "error": None, "tracker": _ProgressTracker()}
+        _th = threading.Thread(target=_job, daemon=True)
+        _th.start()
+        _bar = st.progress(0.0, text=_tip)
+        _names = {
+            "获取行情数据": "① 获取行情与基本面数据",
+            "八大维度分析": "② 开始八大维度分析",
+            "① 个股/基金特性与阶段": "② 个股/基金特性与阶段",
+            "技术面": "③ 技术面",
+            "大盘与外围市场": "③ 大盘与外围市场",
+            "场内基金专属": "③ 基金专属（折溢价/跟踪）",
+            "基本面": "③ 基本面",
+            "资金面与主力动向": "③ 资金面与主力动向",
+            "主力操盘意图": "③ 主力操盘意图",
+            "市场情绪与博弈": "③ 市场情绪与博弈",
+            "宏观与行业": "③ 宏观与行业",
+            "消息面与突发事件": "③ 消息面",
+            "周期与季节性": "③ 周期与季节性",
+            "金融理论模型": "③ 理论模型",
+            "因子汇总与概率推导": "④ 因子汇总与概率推导",
+            "推导概率": "⑤ 推导各周期概率与幅度",
+            "生成报告": "⑥ 生成报告",
+        }
+        _last = -1.0
+        _t0 = time.time()
+        while _th.is_alive():
+            # smooth_snapshot：在两次真实上报之间平滑爬升（实时动态），
+            # 避免长阶段进度条长时间不动、短阶段一下跳很多。
+            _stage, _pct, _ = _box["tracker"].smooth_snapshot(step_seconds=4.0)
+            if _pct >= _last:               # 避免无意义刷新
+                _last = _pct
+                _el = time.time() - _t0
+                _bar.progress(min(_pct, 1.0),
+                              text="%s ｜ %.0f%% ｜ 已用 %.0f 秒" % (
+                                  _names.get(_stage, _stage or _tip),
+                                  _pct * 100, _el))
+            time.sleep(0.15)
+        _th.join(timeout=1.0)
+        _bar.progress(1.0, text="分析完成")
+        time.sleep(0.2)
+        _bar.empty()
+        if _box["error"] is not None:
+            raise _box["error"]
+        payload = _box["payload"]
+        if payload is None:
+            raise RuntimeError("分析未返回结果（后台任务异常终止）")
     except Exception as exc:  # noqa: BLE001
-        prog.empty()
         st.error("分析失败：%s" % exc)
         with st.expander("错误详情"):
             st.code(traceback.format_exc())
@@ -2597,16 +3714,69 @@ def main() -> None:
 
     symbol = payload.get("symbol") or sym_raw
     render_header(payload)
-    render_overview(payload)
+    if payload.get("forecasts"):
+        render_overview(payload)
+    elif payload.get("detail"):
+        st.info(payload["detail"])
 
-    tabs = st.tabs([":material/insights: 预测总览", ":material/candlestick_chart: 图表",
-                    ":material/search: 因子与逻辑", ":material/explore: 八维明细",
-                    ":material/science: 历史验证", ":material/download: 导出/工具"])
+    # 关键点加权提示：让用户知道"为什么这次权重和平时不同"
+    _kp = (payload.get("indicators") or {}).get("keypoint") or {}
+    if not _kp:
+        _kp = ((payload.get("volatility") or {}).get("keypoint") or {})
+    _kstat = (_kp.get("reweight") or {}) if isinstance(_kp, dict) else {}
+    if _kstat.get("note") and float(_kstat.get("focus") or 0) > 0.15:
+        st.info("**关键点动态加权**：%s。\n\n%s"
+                % (_kstat["note"],
+                   (_kp.get("detail") or "")
+                   + "　（走势反转/突破附近，**当日量能与资金流的信息量高于累计多日**，"
+                     "因此自动提高了当日类因子的权重、压低累计类因子，"
+                     "并把总权重归一——不会因为调权而放大整体杠杆。）"))
+
+    # 面板按用户在初始界面选择的范围渲染（结果页保持同一范围，不重复询问）
+    panels = {"market": ["大盘", "板块"],
+              "subject": ["标的"]}.get(payload.get("scope") or scope,
+                                       ["大盘", "板块", "标的"])
+    st.caption("当前范围：**%s**　（如需换范围，请改上方「选择分析范围」后重新分析）"
+               % scope_label.split(" ", 1)[-1])
+
+    # ---- 大盘面板 ---- #
+    if "大盘" in panels:
+        with st.expander("大盘分析（三层嵌套 + 操作技巧）", expanded=True):
+            render_market_panel(payload)
+
+    # ---- 板块面板 ---- #
+    if "板块" in panels:
+        with st.expander("板块分析（轮动 / 热点 / 宽度）", expanded=True):
+            render_board_panel(payload)
+
+    # ---- 标的面板：原有六个页签 ---- #
+    if "标的" in panels:
+        if payload.get("forecasts"):
+            _render_subject_scoped(payload, symbol, opts, sym_raw)
+        else:
+            st.info("本范围不含个股/基金分析。"
+                    "如需标的数据，请把「选择分析范围」改为「综合分析」或「个股/基金分析」。")
+
+    st.markdown("<div class='risk'>%s</div>" % DISCLAIMER, unsafe_allow_html=True)
+
+
+def _render_subject_scoped(payload: dict, symbol: str, opts: dict,
+                           sym_raw: str) -> None:
+    """标的自身的六个页签（原主界面内容，抽成函数以便复用）。"""
+    # 页签标题用纯中文：:material/... 图标标记只在部分 Streamlit 版本
+    # 于标签串中生效，一旦不支持就会显示成字面量英文，不如直接不用。
+    tabs = st.tabs(["预测总览", "图表", "因子与逻辑", "八维明细",
+                    "历史验证", "导出/工具"])
 
     with tabs[0]:
         render_forecast_table(payload)
-        st.caption("说明：**大涨/大跌概率**按各周期的阈值计算（如1天 ±3%、20天 ±12%、1年 ±50%）；"
-                   "**置信度**已根据历史回测结果自动折扣。")
+        st.caption(
+            "**基准说明**：本表所有概率、期望幅度、区间，都是相对"
+            "**本次分析时的收盘价（现价）** 计算——即"
+            "「到目标日为止，相对现在涨了还是跌了」，"
+            "**不是**「相对目标日前一个交易日」。\n\n"
+            "**大涨/大跌概率**按各周期阈值计算（1天 ±3%、20天 ±12%、1年 ±50% 等）；"
+            "**置信度**已根据历史回测结果自动折扣。")
     with tabs[1]:
         render_charts(payload)
     with tabs[2]:
@@ -2628,9 +3798,22 @@ def main() -> None:
             st.markdown("**数据说明**")
             for n in payload["notes"]:
                 st.caption("· %s" % n)
-        st.caption("数据来源：%s" % payload.get("meta_sources"))
-
-    st.markdown("<div class='risk'>%s</div>" % DISCLAIMER, unsafe_allow_html=True)
+        # meta_sources 是 dict（模块 → 数据源），直接 %s 会打印成
+        # "{'daily': 'tencent', …}" 这种原始字典。这里渲染成可读中文。
+        _src = payload.get("meta_sources") or {}
+        if isinstance(_src, dict) and _src:
+            _pairs = []
+            for _k, _v in _src.items():
+                _lab = _label("meta_" + str(_k)) if False else None
+                _pairs.append("%s：%s" % (
+                    {"daily": "日线", "sector": "板块", "stage": "个股特性",
+                     "financials": "财务", "capital": "资金", "sentiment": "情绪",
+                     "macro": "宏观", "news": "消息", "market": "大盘",
+                     "fund": "基金", "ml": "AI模型"}.get(str(_k), str(_k)),
+                    _v))
+            st.caption("数据来源：" + "；".join(_pairs))
+        elif _src:
+            st.caption("数据来源：%s" % _src)
 
 
 def _payload_text(p: dict) -> str:

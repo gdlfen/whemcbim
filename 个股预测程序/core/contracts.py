@@ -249,6 +249,29 @@ class Factor:
     weight_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
+        # ---- 强度按可信度封顶 ----
+        # 低可信度却宣称高强度的因子会让弱证据主导结论（AI 核对指出：
+        # 板块宽度强度0.80/可信度0.40、"弱反弹"强度0.70/可信度0.35 均属失配）。
+        # 规则：strength ≤ reliability + 0.25，下限 0.15。
+        # 只压强度，不改方向与可信度——语义上"没把握就不该说得那么重"。
+        try:
+            _rel = float(self.reliability)
+            _st = float(self.strength)
+            _cap = max(0.15, _rel + 0.25)
+            # 中性因子（direction=0）不表达方向，强度应封顶 0.25。
+            # AI 核对指出大量因子"方向=中却强度 0.85~1.00"，属语义矛盾：
+            # 强度是"看多想空的程度"，中性就没有程度可言。
+            # 强度硬上限 0.90：出现 1.00/0.99 这类"绝对化"强度会让 AI 与用户
+            # 质疑"凭什么这么肯定"（图2 第2条、图6 第1条）。
+            # 任何单一因子都不该表达"100% 确定"。
+            _cap = min(_cap, 0.90)
+            if int(self.direction) == 0:
+                _cap = min(_cap, 0.25)
+            if _st > _cap:
+                self.strength = round(_cap, 4)
+        except Exception:  # noqa: BLE001
+            pass
+
         self.direction = int(0 if self.direction is None else self.direction)
         if self.direction > 0:
             self.direction = 1
@@ -430,8 +453,11 @@ class ProbabilityForecast:
     bars: int = 0
     days: int = 0
 
-    p_up: float = 0.5                  # P(区间收益 > 0)
-    p_down: float = 0.5                # P(区间收益 < 0) = 1 - p_up
+    #: P(未来第 bars 个交易日收盘价 > **分析当日**收盘价)
+    #: 注意基准是"分析时的股价"，**不是**目标日前一个交易日的股价。
+    #: 即：预测"到目标日为止相对现在涨了多少"，而不是"最后一天涨没涨"。
+    p_up: float = 0.5
+    p_down: float = 0.5                # = 1 - p_up（同样以分析日价为基准）
     p_flat: float = 0.0                # P(|收益| < 阈值)
     p_big_up: float = 0.0              # P(收益 > 阈值)   阈值见 big_move_threshold
     p_big_down: float = 0.0

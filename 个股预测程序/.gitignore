@@ -1,0 +1,39 @@
+# ---- 运行期产物（报告 / 图表 / 缓存）----
+reports/
+charts/
+_report_selftest/
+_chart_selftest/
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- Streamlit / 编辑器 ----
+.streamlit/secrets.toml
+.vscode/
+.idea/
+*.swp
+
+# ---- 数据与日志 ----
+*.log
+*.pkl
+*.tmp
+
+# ---- 截图与临时产物 ----
+screenshots/
+*.png
+
+# ---- 自我学习档案（保留目录结构，忽略内容）----
+data/*.jsonl
+data/*.json
+.learn_selftest/
+.verify_learn/
+.learn_test/
+
+# 端到端渲染测试的载荷缓存
+tests/.payload_cache.json
+.tmp/
+tests/.smoke_payloads.json
+
+# 含 API Key，禁止提交
+data/ai_config.json

@@ -670,6 +670,241 @@ def fetch_fund_holdings(code: str, top: int = 10) -> list:
     return rows[:top]
 
 
+
+# --------------------------------------------------------------------------- #
+# 成分股（持仓）分析
+# --------------------------------------------------------------------------- #
+def fetch_fund_holdings_detail(code: str, top: int = 10) -> list:
+    """抓前十大持仓，带**股票代码**与占净值比例。
+
+    Returns
+    -------
+    list[dict]：``[{"code","name","ratio"}, …]``，按 ratio 降序
+    """
+    from .datasource import http_get
+
+    code = re.sub(r"\D", "", str(code or ""))
+    if not code:
+        return []
+    url = ("https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc"
+           "&code=%s&topline=%d" % (code, max(top, 10)))
+    try:
+        txt = http_get(url, timeout=14, retries=1,
+                       headers={"Referer": "https://fund.eastmoney.com/"})
+    except Exception as exc:  # noqa: BLE001
+        log.debug("持仓明细接口失败 %s: %s", code, exc)
+        return []
+    if not txt:
+        return []
+    body = txt
+    m = re.search(r'content:"(.*?)",arryear', txt, re.S)
+    if m:
+        body = m.group(1).replace('\\"', '"')
+    rows: list = []
+    seen: set = set()
+    for tb in re.findall(r"<tbody>(.*?)</tbody>", body, re.S)[:1]:
+        for tr in re.findall(r"<tr>(.*?)</tr>", tb, re.S):
+            tds = [re.sub(r"<[^>]+>", "", x).strip()
+                   for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+            if len(tds) < 7:
+                continue
+            # 典型列：序号 股票代码 股票名称 … 占净值比例 持股数 持仓市值
+            scode = ""
+            for t in tds[1:4]:
+                if re.fullmatch(r"\d{6}", t or ""):
+                    scode = t
+                    break
+            if not scode or scode in seen:
+                continue
+            name = ""
+            for t in tds[2:5]:
+                if t and not re.fullmatch(r"[\d.%\-]+", t) and len(t) <= 14:
+                    name = t
+                    break
+            ratio = None
+            for t in tds:
+                if t.endswith("%") and re.match(r"^[\d.]+%$", t):
+                    ratio = safe_float(t.rstrip("%"))
+                    break
+            if not name:
+                continue
+            seen.add(scode)
+            rows.append({"code": scode, "name": name,
+                         "ratio": ratio if ratio is not None else 0.0})
+    rows.sort(key=lambda x: -(x.get("ratio") or 0))
+    return rows[:top]
+
+
+def analyze_holdings(code: str, nav: pd.DataFrame | None = None,
+                     top: int = 10, max_workers: int = 6) -> dict:
+    """分析基金成分股（持仓）的当前状态。
+
+    做法：抓前十大持仓 → 并发取个股日线 → 按权重算组合强弱 + 广度。
+
+    Returns
+    -------
+    dict：``{"items","weighted_ret_1d/5d/20d","breadth","concentration",
+    "detail","top_heavy"}``
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    out: dict = {"items": [], "detail": "", "concentration": {}}
+    holds = fetch_fund_holdings_detail(code, top=top)
+    if not holds:
+        out["detail"] = "未取到前十大持仓（基金可能尚未披露季报）"
+        return out
+
+    from .datasource import fetch_daily
+
+    def _one(h: dict):
+        try:
+            df = fetch_daily(h["code"], days=180)
+            return h, df
+        except Exception as exc:  # noqa: BLE001
+            log.debug("成分股 %s 取数失败: %s", h["code"], exc)
+            return h, None
+
+    frames: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(holds), max_workers))) as pool:
+        futs = [pool.submit(_one, h) for h in holds]
+        for fu in as_completed(futs):
+            try:
+                h, df = fu.result()
+                if df is not None and len(df) >= 25:
+                    frames[h["code"]] = df
+            except Exception:  # noqa: BLE001
+                continue
+
+    items: list = []
+    for h in holds:
+        df = frames.get(h["code"])
+        row = dict(h)
+        if df is not None and len(df) >= 21:
+            try:
+                c = df["close"].astype(float).dropna()
+                row["ret_1d"] = round(float(c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
+                row["ret_5d"] = round(float(c.iloc[-1] / c.iloc[-6] - 1) * 100, 2)
+                row["ret_20d"] = round(float(c.iloc[-1] / c.iloc[-21] - 1) * 100, 2)
+                row["above_ma20"] = bool(c.iloc[-1] >= c.tail(20).mean())
+                win = min(len(c), 250)
+                hi, lo = float(c.tail(win).max()), float(c.tail(win).min())
+                row["pos_pct"] = round(
+                    (float(c.iloc[-1]) - lo) / max(hi - lo, 1e-9) * 100, 1)
+            except Exception:  # noqa: BLE001
+                pass
+        items.append(row)
+    out["items"] = items
+
+    # ---- 按权重加权的组合涨跌（只统计有数据的成分股，权重归一）---- #
+    def _wavg(field: str):
+        tot, acc = 0.0, 0.0
+        for it in items:
+            v = it.get(field)
+            w = float(it.get("ratio") or 0.0)
+            if v is None or w <= 0:
+                continue
+            tot += w
+            acc += w * float(v)
+        return round(acc / tot, 3) if tot > 0 else None
+
+    out["weighted_ret_1d"] = _wavg("ret_1d")
+    out["weighted_ret_5d"] = _wavg("ret_5d")
+    out["weighted_ret_20d"] = _wavg("ret_20d")
+
+    # ---- 广度：多少成分股在涨 / 站上 MA20 ---- #
+    valid = [it for it in items if it.get("ret_1d") is not None]
+    if valid:
+        up = sum(1 for it in valid if (it.get("ret_1d") or 0) > 0)
+        out["breadth_up_pct"] = round(up / len(valid) * 100, 1)
+        out["breadth_valid"] = len(valid)
+    ma = [it for it in items if it.get("above_ma20") is not None]
+    if ma:
+        n = sum(1 for it in ma if it.get("above_ma20"))
+        out["breadth_ma20_pct"] = round(n / len(ma) * 100, 1)
+
+    # ---- 集中度 ---- #
+    ratios = [float(it.get("ratio") or 0) for it in items]
+    out["concentration"] = {
+        "top1": round(ratios[0], 2) if ratios else None,
+        "top5": round(sum(ratios[:5]), 2),
+        "top10": round(sum(ratios[:10]), 2),
+        "n": len([r for r in ratios if r > 0]),
+    }
+    out["top_heavy"] = bool(out["concentration"]["top5"] >= 40)
+
+    # ---- 与基金净值的偏离：估算 vs 实际 ---- #
+    if nav is not None and len(nav) and out.get("weighted_ret_1d") is not None:
+        try:
+            nv = nav["nav"].astype(float).dropna()
+            if len(nv) >= 2:
+                actual = float(nv.iloc[-1] / nv.iloc[-2] - 1) * 100
+                out["nav_ret_1d"] = round(actual, 3)
+                # 估算只覆盖前十大，通常是实际波动的一部分，故给区间描述
+                out["gap_vs_nav"] = round(out["weighted_ret_1d"] - actual, 3)
+        except Exception:  # noqa: BLE001
+            pass
+
+    bits = ["前十大持仓合计 %.2f%%" % out["concentration"]["top10"]]
+    if out.get("weighted_ret_1d") is not None:
+        bits.append("加权涨跌（今日）%+.2f%%" % out["weighted_ret_1d"])
+    if out.get("weighted_ret_20d") is not None:
+        bits.append("加权近20日 %+.2f%%" % out["weighted_ret_20d"])
+    if out.get("breadth_up_pct") is not None:
+        bits.append("%d 只成分股中 %.0f%% 上涨" % (out["breadth_valid"],
+                                                out["breadth_up_pct"]))
+    if out.get("breadth_ma20_pct") is not None:
+        bits.append("%.0f%% 站上 MA20" % out["breadth_ma20_pct"])
+    if out["top_heavy"]:
+        bits.append("**集中度高（前五 %.1f%%），基金涨跌被少数个股主导**"
+                    % out["concentration"]["top5"])
+    out["detail"] = "；".join(bits)
+    return out
+
+
+def holdings_factors(ana: dict, ftype: str = "") -> list:
+    """把成分股分析转成因子。"""
+    out: list[Factor] = []
+    if not ana or not ana.get("items"):
+        return out
+    wr1 = ana.get("weighted_ret_1d")
+    wr20 = ana.get("weighted_ret_20d")
+    if wr1 is not None:
+        out.append(_f(
+            "fund_holding_strength", "成分股加权涨跌 %+.2f%%" % wr1,
+            DIR_BULL if wr1 > 0.2 else (DIR_BEAR if wr1 < -0.2 else DIR_NEUTRAL),
+            min(abs(wr1) / 3.0 + 0.2, 0.8), 0.66,
+            "%+.2f%%" % wr1,
+            "按持仓比例加权，前十大成分股今日平均 %+.2f%%（近20日 %s%%）。"
+            "成分股实时交易，其强弱**领先于**基金净值——净值每天只在收盘后更新一次。"
+            % (wr1, wr20 if wr20 is not None else "—"),
+            "组合穿透/净值预估", ("d1", "d5")))
+    bu = ana.get("breadth_up_pct")
+    if bu is not None:
+        out.append(_f(
+            "fund_holding_breadth", "成分股广度 %.0f%%" % bu,
+            DIR_BULL if bu >= 60 else (DIR_BEAR if bu <= 30 else DIR_NEUTRAL),
+            min(abs(bu - 50) / 100.0 * 1.8 + 0.2, 0.8), 0.64,
+            "%d 只中 %.0f%% 上涨" % (ana.get("breadth_valid") or 0, bu),
+            "前十大成分股中 %.0f%% 今日上涨，%.0f%% 站上 MA20。"
+            "广度高说明是整体走强（非个别拉动），基金跟随概率大。"
+            % (bu, ana.get("breadth_ma20_pct") or 0),
+            "组合广度/内部一致性", ("d1", "d5", "d10")))
+    conc = ana.get("concentration") or {}
+    if conc.get("top5"):
+        heavy = ana.get("top_heavy")
+        out.append(_f(
+            "fund_concentration", "持仓集中度 前五 %.1f%%" % conc["top5"],
+            DIR_NEUTRAL, min(conc["top5"] / 80.0 + 0.15, 0.7), 0.68,
+            "前五 %.1f%%｜前十 %.1f%%" % (conc["top5"], conc.get("top10") or 0),
+            "前五大持仓合计 %.1f%%，前十大 %.1f%%。%s"
+            % (conc["top5"], conc.get("top10") or 0,
+               "**集中度很高**：基金涨跌基本由这几只决定，"
+               "等于间接买入这几只股票，需关注它们的风险。" if heavy else
+               "分散度尚可，单一标的对基金影响有限。"),
+            "组合集中度/穿透持仓", ("m1", "q1")))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # 六、一站式入口
 # --------------------------------------------------------------------------- #
@@ -696,7 +931,19 @@ def analyze_fund(code: str, name: str, price: pd.DataFrame,
     result["profile"] = profile or {}
     result["type"] = cls["type"]
     result["type_label"] = cls["type_label"]
+    # ---- 成分股（持仓）分析：基金的"穿透"视角 ----
+    hold_ana: dict = {}
+    try:
+        hold_ana = analyze_holdings(code, nav)
+        result["holdings_analysis"] = hold_ana
+    except Exception as exc:  # noqa: BLE001
+        log.debug("成分股分析失败 %s: %s", code, exc)
     result["factors"] = fund_factors(code, name, price, nav, index_df, profile, snapshot)
+    try:
+        result["factors"] = list(result["factors"]) + holdings_factors(
+            hold_ana, cls.get("type") or "")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("成分股因子生成失败: %s", exc)
     bits = ["已识别为 %s" % cls["type_label"]]
     if navm.get("premium_pct") is not None:
         bits.append("当前折溢价 %+.2f%%" % navm["premium_pct"])
@@ -708,6 +955,8 @@ def analyze_fund(code: str, name: str, price: pd.DataFrame,
         bits.append(trk["detail"])
     if profile.get("fund_size_text"):
         bits.append("规模 %s" % profile["fund_size_text"])
+    if hold_ana.get("weighted_ret_1d") is not None:
+        bits.append("成分股加权 %+.2f%%" % hold_ana["weighted_ret_1d"])
     result["detail"] = "；".join(bits)
     return result
 

@@ -59,11 +59,13 @@ CORE_MODULES = [
     "charts", "report", "engine",
     # 新增维度模块
     "global_market", "main_force_intent", "commodity_industry", "fund",
+    "market_structure", "market_board", "progress", "v8_guard", "keypoint", "market_forecast", "market_fundamental", "market_phase", "market_context", "freshness", "macro_source", "retail_heat", "ai_analyst",
 ]
 # 允许缺失的模块（缺失时引擎会自动跳过该维度，只是功能减少）
 OPTIONAL_MODULES = {"datasource", "technical", "fundamental", "capital",
                     "sentiment", "macro", "newsflow",
-                    "global_market", "main_force_intent", "commodity_industry", "fund"}
+                    "global_market", "main_force_intent", "commodity_industry", "fund",
+                    "market_structure", "market_board", "progress", "v8_guard", "keypoint", "market_forecast", "market_fundamental"}
 
 
 def check_files() -> str:
@@ -524,6 +526,293 @@ def check_fund() -> str:
             % (len(cases), len(cases), nm2["premium_pct"], trk["trk_corr"], len(fs)))
 
 
+def check_market_structure() -> str:
+    """大盘三层嵌套 + 板块轮动（离线合成数据，不发网络请求）。"""
+    import numpy as np
+    import pandas as pd
+
+    from core import market_board as MB
+    from core import market_structure as MS
+    from core.selftest_data import make_ohlcv
+
+    n = 500
+    # 牛市主升
+    up = np.linspace(3000, 4200, n) + np.sin(np.arange(n) / 9) * 30
+    df = make_ohlcv(n, seed=3, start_price=3000.0)
+    df["close"] = up
+    df["high"] = up * 1.012
+    df["low"] = up * 0.988
+    v = df["volume"].to_numpy(float).copy()
+    v[:int(n * 0.7)] *= 0.8
+    v[int(n * 0.7):] *= 1.6
+    df["volume"] = v
+    r = MS.analyze_market_structure(df, name="合成")
+    assert r["regime"]["regime"] in ("牛市", "熊市", "震荡市")
+    assert r["phase"]["label"], "应识别出波段"
+    assert r["swing"]["structure"] in ("上升波段", "下降波段", "震荡波段")
+    assert r["factors"], "应生成三层结构因子"
+    for f in r["factors"]:
+        assert 0 <= f.strength <= 1 and 0 <= f.reliability <= 1
+        assert f.detail and f.theory and "None" not in str(f.value)
+    assert r["discipline"]["position_advice"], "应给出仓位建议"
+    # 熊市
+    dn = np.linspace(4200, 3000, n) + np.sin(np.arange(n) / 8) * 25
+    d2 = make_ohlcv(n, seed=7, start_price=4200.0)
+    d2["close"] = dn
+    d2["high"] = dn * 1.008
+    d2["low"] = dn * 0.992
+    r2 = MS.analyze_market_structure(d2)
+    assert r2["regime"]["regime"] == "熊市", r2["regime"]["regime"]
+    assert r2["phase"]["label"] in ("熊初（出清段）", "熊中（阴跌段）", "熊末（筑底段）"), \
+        r2["phase"]["label"]
+    # 板块宽度：双向采样应给出合理宽度（不能恒为 100%）
+    boards = ([{"code": "BK%04d" % i, "name": "涨%d" % i, "pct": 2.0}
+               for i in range(50)] +
+              [{"code": "DK%04d" % i, "name": "跌%d" % i, "pct": -2.0}
+               for i in range(50)])
+    rot = MB.board_rotation(boards, {})
+    # 50 涨 + 50 跌 → 宽度必须是 50%，不能像旧版那样恒报 100%
+    assert 40 <= (rot.get("board_breadth_pct") or 0) <= 60, rot.get("board_breadth_pct")
+    # 单向（全涨）时应判定为"不可靠"——这才是幸存者偏差的防线
+    onesided = [{"code": "BK%04d" % i, "name": "涨%d" % i, "pct": 2.0}
+                for i in range(100)]
+    rot2 = MB.board_rotation(onesided, {})
+    assert rot2.get("breadth_reliable") is False, "全是上涨时应标注为不可靠"
+    assert "不完整" in (rot2.get("breadth_quality") or ""), rot2.get("breadth_quality")
+    # 边界
+    assert MS.analyze_market_structure(None)["detail"]
+    assert MB.market_overview({})["detail"]
+    assert MB.board_rotation([], {})["detail"]
+    return ("大周期=%s｜波段=%s｜短线=%s｜板块宽度=%.0f%%（完整性已标注）"
+            % (r["regime"]["regime"], r["phase"]["label"],
+               r["swing"]["structure"], rot.get("board_breadth_pct") or 0))
+
+
+def check_feature_wiring() -> str:
+    """功能完整性：关键功能的界面接入点不得静默丢失。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_feature_wiring.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_feature_wiring.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-12:])
+        raise AssertionError("关键功能界面接入点缺失：\\n%s" % tail)
+    line = [x for x in out.splitlines() if "app.py：" in x]
+    return line[0].strip() if line else "功能完整性检查通过"
+
+
+def check_v8_safety() -> str:
+    """V8（py_mini_racer）并发安全：并行分析不得让进程崩溃。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_v8_safety.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_v8_safety.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=300)
+    out = (r.stdout or "") + (r.stderr or "")
+    # 进程崩溃时 returncode 会是非 0 且输出含 FATAL/abort
+    if r.returncode != 0 or "FATAL" in out:
+        tail = "\\n".join(out.strip().splitlines()[-12:])
+        raise AssertionError("V8 并发不安全（会导致进程崩溃）：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines()
+            if "已加锁" in x or "进程存活" in x or "预热身" in x]
+    return "；".join(keep) if keep else "V8 并发安全检查通过"
+
+
+def check_cache_purity() -> str:
+    """缓存函数必须纯粹：不得调用 Streamlit UI（否则缓存命中会崩）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_cache_purity.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_cache_purity.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("缓存函数含 UI 调用（会抛 CacheReplayClosureError）：\\n%s"
+                             % tail)
+    line = [x for x in out.splitlines() if "检查了" in x]
+    return line[0].strip() if line else "缓存纯净性检查通过"
+
+
+def check_progress_tracker() -> str:
+    """进度追踪器：单调递增、夹取、多线程并发安全。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "core", "progress.py")
+    r = subprocess.run([sys.executable, "-m", "core.progress"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=120, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-8:])
+        raise AssertionError("进度追踪器自测失败：\\n%s" % tail)
+    line = [x for x in out.splitlines() if "self-test OK" in x]
+    return line[0].strip() if line else "进度追踪器 OK"
+
+
+def check_render_smoke() -> str:
+    """渲染函数冒烟：用真实 payload 实际调用每个 render_*（含全空降级）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_render_smoke.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_render_smoke.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=900, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-16:])
+        raise AssertionError("渲染函数冒烟失败（有崩溃或脏数据）：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines()
+            if "发现" in x or "共调用" in x]
+    return "；".join(keep) if keep else "渲染冒烟通过"
+
+
+def check_prediction_basis() -> str:
+    """预测基准语义：必须相对分析当日股价，不是目标日前一交易日。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_prediction_basis.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_prediction_basis.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=120, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-12:])
+        raise AssertionError("预测基准语义不符：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines() if "累计（相对分析日）" in x]
+    return keep[0] if keep else "预测基准语义正确"
+
+
+def check_keypoint() -> str:
+    """关键点动态加权：识别事件、调权、总权重守恒。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "core.keypoint"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=180, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("关键点模块自测失败：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines()
+            if "聚焦度" in x or "总权重" in x]
+    return "；".join(keep[:2]) if keep else "关键点加权 OK"
+
+
+def check_market_forecast() -> str:
+    """大盘/板块概率预测：8 周期、概率合法、区间自洽。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "core.market_forecast"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=300, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("大盘/板块预测自测失败：\\n%s" % tail)
+    line = [x for x in out.splitlines() if "个周期" in x]
+    return line[0].strip() if line else "大盘/板块预测 OK"
+
+
+def check_market_fundamental() -> str:
+    """大盘基本面替代物：估值分位/两融/北向/开户数 + 新鲜度过滤。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "core.market_fundamental"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=300, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("大盘基本面替代物自测失败：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines() if "生成" in x and "因子" in x]
+    return keep[0] if keep else "大盘基本面替代物 OK"
+
+
+def check_freshness() -> str:
+    """通用数据新鲜度校验机制。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "core.freshness"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=120, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("新鲜度校验机制自测失败：\\n%s" % tail)
+    return "通用新鲜度校验 OK（日5/周14/月70/季130 天）"
+
+
+def check_retail_heat() -> str:
+    """散户入场热度（开户数代理指标）。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "core.retail_heat"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=180, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("散户热度模块自测失败：\\n%s" % tail)
+    return "散户入场热度代理 OK（成交额水位/振幅/两融合成）"
+
+
+def check_render_wiring() -> str:
+    """面板调用检查：每个 render_* 都必须真的被调用过（防"写了没挂"）。"""
+    import subprocess
+    import sys
+
+    script = os.path.join(_HERE, "tests", "test_render_wiring.py")
+    if not os.path.exists(script):
+        raise FileNotFoundError("缺少 tests/test_render_wiring.py")
+    r = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore", timeout=120, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        tail = "\\n".join(out.strip().splitlines()[-14:])
+        raise AssertionError("有渲染函数写了但没挂：\\n%s" % tail)
+    line = [x.strip() for x in out.splitlines() if "渲染函数" in x]
+    return line[0] if line else "面板调用检查通过"
+
+
+def check_ai_analyst() -> str:
+    """AI 复核模块：未配置 Key 时安全降级、摘要完整、不冒充数据。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "core.ai_analyst"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", timeout=180, cwd=_HERE)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or "self-test OK" not in out:
+        tail = "\\n".join(out.strip().splitlines()[-10:])
+        raise AssertionError("AI 复核模块自测失败：\\n%s" % tail)
+    keep = [x.strip() for x in out.splitlines() if "字符数" in x]
+    return ("AI 复核 OK（未配置 Key 安全降级）" +
+            ("；" + keep[0] if keep else ""))
+
+
 def check_online(symbol: str = "600519") -> str:
     """真实数据端到端测试。"""
     from core import datasource as ds
@@ -582,10 +871,21 @@ def main() -> int:
     check("Streamlit 应用可编译", check_app_syntax)
     check("内置字体中文覆盖", check_font_coverage)
     check("缓存函数签名（防 UnhashableParamError）", check_cache_signature)
+    check("缓存函数纯粹性（防 CacheReplayClosureError）", check_cache_purity)
     check("界面字段标签无英文残留", check_labels)
     check("因子展示值无 None/nan", check_factor_display)
+    check("预测基准=分析当日股价", check_prediction_basis)
+    check("关键点动态加权", check_keypoint)
+    check("大盘/板块概率预测", check_market_forecast)
+    check("大盘基本面替代物", check_market_fundamental)
+    check("通用数据新鲜度校验", check_freshness)
+    check("散户入场热度代理", check_retail_heat)
+    check("AI 复核模块", check_ai_analyst)
     check("渲染层收敛（无手写渲染）", check_render_rules)
+    check("关键功能界面接入完整", check_feature_wiring)
     check("端到端渲染输出扫描", check_render_output)
+    check("渲染函数冒烟（真实payload×5）", check_render_smoke)
+    check("面板调用检查（防写了没挂）", check_render_wiring)
 
     print("\n【2】数值内核正确性")
     check("特征/规则分因果性（无未来函数）", check_causality)
@@ -593,7 +893,10 @@ def main() -> int:
     check("概率/区间/波动率自洽性", check_probability_consistency)
     check("大盘/外围联动 + 主力意图", check_market_and_intent)
     check("自我学习闭环（回填→核账→校准）", check_self_learning)
+    check("进度追踪器（并发安全）", check_progress_tracker)
+    check("V8 并发安全（防进程崩溃）", check_v8_safety)
     check("场内基金（折溢价/跟踪/因子）", check_fund)
+    check("大盘三层结构 + 板块轮动", check_market_structure)
     if not args.skip_heavy:
         check("AI 模型训练与预测", check_models)
         check("历史回测与随机对照", check_backtest)

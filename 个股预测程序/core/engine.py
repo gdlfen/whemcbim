@@ -23,6 +23,20 @@ from . import config
 from .contracts import HORIZONS, AnalysisBundle, FactorSet, PredictionResult
 from .utils import get_logger, http_get, normalize_symbol, retry_call
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+# 进程启动即给 akshare 加 V8 锁并预热身：
+# 并行分析时多线程同时用 py_mini_racer 会让 V8 触发
+# "IsConfigurablePoolInitialized" 断言并 abort 整个进程（硬崩溃，抓不住）。
+# 必须在任何并行开始前完成安装。
+try:  # pragma: no cover
+    from . import v8_guard as _v8
+
+    _v8.install()
+except Exception:  # noqa: BLE001
+    pass
+
 log = get_logger()
 
 
@@ -277,6 +291,15 @@ class Predictor:
         self.self_learning = (bool(config.FORECAST.get("self_learning", True))
                               if self_learning is None else bool(self_learning))
         self.sources: dict[str, str] = {}
+        # 并行分析时的互斥锁：bundle.factors / self.sources / bundle.errors
+        # 会被多个线程同时写入，必须串行化（可重入，避免嵌套调用死锁）
+        import threading as _th
+        self._lock = _th.RLock()
+        # 是否并行执行分析阶段（config.SPEED["parallel"] 可关闭，便于调试）
+        try:
+            self.parallel = bool((config.SPEED or {}).get("parallel", True))
+        except Exception:  # noqa: BLE001
+            self.parallel = True
 
     # ------------------------------------------------------------------ #
     # 日志
@@ -417,35 +440,132 @@ class Predictor:
     # ------------------------------------------------------------------ #
     # 2. 八大维度分析
     # ------------------------------------------------------------------ #
-    def analyze(self, bundle: AnalysisBundle) -> None:
+    def analyze(self, bundle: AnalysisBundle, progress=None) -> None:
+        """执行八大维度分析。
+
+        ``progress(stage_name, pct)`` 会在每个步骤前后被调用，
+        供界面显示动态进度（本方法自身不碰任何 UI）。
+        """
         df = bundle.ohlcv
         idx = bundle.index_data
         snap = bundle.snapshot or {}
         price = snap.get("price")
 
-        steps = [
-            ("个股/基金特性与阶段", self._stage),
-            ("技术面", self._technical),
+        # ---------------- 阶段化 + 并行 ----------------
+        # 实测瓶颈全在网络等待：基本面 18.5s、宏观 17.8s、情绪 12.8s、
+        # 大盘外围 12.3s，而技术/资金/意图/消息/周期/理论合计仅 4.7s。
+        # 这四个大头互不依赖，并行后总耗时 ≈ max(单个) 而非 sum。
+        network_steps = [
             ("大盘与外围市场", self._global_market),
-            ("场内基金专属", self._fund),
             ("基本面", self._fundamental),
-            ("资金面与主力动向", self._capital),
-            ("主力操盘意图", self._main_intent),
             ("市场情绪与博弈", self._sentiment),
             ("宏观与行业", self._macro),
+        ]
+        local_steps = [
+            ("技术面", self._technical),
+            ("场内基金专属", self._fund),
+            ("资金面与主力动向", self._capital),
+            ("主力操盘意图", self._main_intent),
             ("消息面与突发事件", self._news),
             ("周期与季节性", self._seasonality),
             ("金融理论模型", self._theory),
         ]
-        for label, fn in steps:
+
+        #: 步骤名 → 在总进度中的区间（阶段A后 0.30，B 段 0.30~0.62，C 段 0.62~0.95）
+        _span = {"B": (0.30, 0.62), "C": (0.62, 0.95)}
+        _pc = {"B": 0.0, "C": 0.0}
+
+        def _report(phase: str, step_name: str, frac: float) -> None:
+            if progress is None:
+                return
+            lo, hi = _span[phase]
             try:
-                if self.verbose:
-                    self._log("分析 %s…" % label)
+                progress(step_name, lo + (hi - lo) * min(max(frac, 0.0), 1.0))
+            except Exception:                                   # noqa: BLE001
+                pass
+
+        def _run_one(item):
+            name, fn = item
+            t0 = time.time()
+            try:
                 fn(bundle)
-            except Exception as exc:  # noqa: BLE001
-                bundle.error(label, exc)
-                log.warning("%s 分析失败：%s", label, exc)
-                log.debug("%s", traceback.format_exc(limit=3))
+                return name, True, time.time() - t0, ""
+            except Exception as exc:                            # noqa: BLE001
+                self._log("%s 分析失败：%s" % (name, exc))
+                with self._lock:
+                    bundle.error(name, exc)
+                return name, False, time.time() - t0, str(exc)
+
+        def _run_parallel(items, label: str, phase: str = "C"):
+            """并发执行一组步骤；每完成一个就上报一次进度。"""
+            if not items:
+                return []
+            if len(items) == 1 or not self.parallel:
+                out = []
+                for i, it in enumerate(items):
+                    _report(phase, it[0], i / max(len(items), 1))
+                    out.append(_run_one(it))
+                _report(phase, items[-1][0], 1.0)
+                return out
+            results = []
+            with ThreadPoolExecutor(max_workers=len(items)) as pool:
+                futs = {pool.submit(_run_one, it): it for it in items}
+                done_n = 0
+                for fu in as_completed(futs):
+                    nm = ""
+                    try:
+                        r1 = fu.result()
+                        results.append(r1)
+                        nm = r1[0]
+                    except Exception as exc:                    # noqa: BLE001
+                        nm = futs[fu][0]
+                        results.append((nm, False, 0.0, str(exc)))
+                    done_n += 1
+                    _report(phase, nm or items[0][0],
+                            done_n / max(len(items), 1))
+            self._log("%s：%d 个步骤并行完成（%s）"
+                      % (label, len(items),
+                         "、".join("%s %.1fs" % (r[0], r[2])
+                                  for r in sorted(results, key=lambda x: -x[2])[:3])))
+            return results
+
+        t_all = time.time()
+        # 阶段 A：必须最先（后续步骤依赖 bundle.stage / snapshot）
+        if progress is not None:
+            try:
+                progress("① 个股/基金特性与阶段", 0.22)
+            except Exception:  # noqa: BLE001
+                pass
+        _run_one(("个股/基金特性与阶段", self._stage))
+        # 阶段 B：四个网络大头并行
+        _run_parallel(network_steps, "阶段B（网络）", "B")
+        # 阶段 C：本地快步骤并行
+        _run_parallel(local_steps, "阶段C（本地）", "C")
+        self._log("八大维度分析总耗时 %.1f 秒" % (time.time() - t_all))
+        # ---- 关键点位动态加权（必须在因子聚合之前）----
+        # 走势反转/突破的近几天，当天的量能与资金比累计多日的更有信息量：
+        # 旧状态的信息在贬值，当日这根才代表状态切换。这里按"聚焦度"调权重，
+        # 并把总权重归一，避免调权变成放杠杆。
+        try:
+            kp = _mod("keypoint")
+            if kp is not None and bundle.ohlcv is not None:
+                got = _call(kp.analyze, bundle.ohlcv) or {}
+                with self._lock:
+                    bundle.factors.extend(got.get("factors") or [])
+                stat = _call(kp.reweight_factors, bundle.factors,
+                             got.get("key") or {}) or {}
+                bundle.indicators["keypoint"] = {
+                    "key": got.get("key") or {},
+                    "reweight": stat,
+                    "detail": got.get("detail") or "",
+                }
+                if stat.get("note"):
+                    self._log(stat["note"])
+                if got.get("detail"):
+                    bundle.note(str(got["detail"]))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("关键点加权失败: %s", exc)
+
         # 收集各模块登记的数据源降级说明（last_notes()），让报告能如实反映数据完整性
         self._collect_notes(bundle)
 
@@ -500,7 +620,12 @@ class Predictor:
 
     # -- 大盘与外围市场 ----------------------------------------------- #
     def _global_market(self, bundle: AnalysisBundle) -> None:
-        """A股大盘、港股、外围股市的影响（同市场联动 / 港股同步 / 美股隔夜）。"""
+        """A股大盘、港股、外围股市的影响（同市场联动 / 港股同步 / 美股隔夜）。
+
+        同时完成**自上而下的前两层**：
+          ① 大盘三层次结构（大周期/中级波段/短线结构/量价/操作纪律）
+          ② 板块轮动（宽度/领涨/动量/阶段匹配）
+        """
         m = _mod("global_market")
         if m is None or bundle.ohlcv is None:
             return
@@ -509,7 +634,7 @@ class Predictor:
                         days=min(self.days, 800), force=False) or {}
         except Exception as exc:  # noqa: BLE001
             bundle.error("大盘与外围", exc)
-            return
+            got = {}
         bundle.market = {
             "snapshot": got.get("snapshot") or {},
             "linkage": got.get("linkage") or {},
@@ -526,6 +651,52 @@ class Predictor:
         self._absorb(bundle, got.get("factors") or [], "market", "global_market")
         if got.get("detail"):
             bundle.note(str(got["detail"]))
+
+        # ---- ① 大盘三层次结构（最上层/中间层/最细层）---- #
+        try:
+            ms = _mod("market_structure")
+            sh = idx_frames.get("sh")
+            if ms is not None and sh is not None and len(sh):
+                struct = _call(ms.analyze_market_structure, sh,
+                               name="上证指数") or {}
+                bundle.market["structure"] = {
+                    "regime": struct.get("regime") or {},
+                    "phase": struct.get("phase") or {},
+                    "swing": struct.get("swing") or {},
+                    "volume_price": struct.get("volume_price") or {},
+                    "levels": struct.get("levels") or {},
+                    "discipline": struct.get("discipline") or {},
+                    "traits": struct.get("traits") or [],
+                    "vp_rules": struct.get("vp_rules") or [],
+                    "detail": struct.get("detail") or "",
+                }
+                self._absorb(bundle, struct.get("factors") or [], "macro",
+                             "market_structure")
+                self._log("大盘结构：%s" % (struct.get("detail") or ""))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("大盘结构分析失败: %s", exc)
+            bundle.error("大盘结构", exc)
+
+        # ---- ② 板块轮动（自上而下的第二层）---- #
+        try:
+            mb = _mod("market_board")
+            if mb is not None:
+                phase_key = ((bundle.market.get("structure") or {})
+                             .get("phase") or {}).get("phase") or ""
+                top = _call(mb.analyze_topdown, idx_frames,
+                            days=min(self.days, 500), phase=phase_key,
+                            with_boards=True) or {}
+                if top:
+                    bundle.market["board_overview"] = top.get("overview") or {}
+                    bundle.market["rotation"] = top.get("rotation") or {}
+                    bundle.market["topdown_detail"] = top.get("detail") or ""
+                    self._absorb(bundle, top.get("factors") or [], "macro",
+                                 "market_board")
+                    if top.get("detail"):
+                        self._log("板块：%s" % str(top["detail"])[:120])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("板块轮动分析失败: %s", exc)
+            bundle.error("板块轮动", exc)
 
     # -- 主力操盘意图 --------------------------------------------------- #
     def _main_intent(self, bundle: AnalysisBundle) -> None:
@@ -606,6 +777,7 @@ class Predictor:
             "nav": got.get("nav") or {},
             "tracking": got.get("tracking") or {},
             "profile": got.get("profile") or profile,
+            "holdings_analysis": got.get("holdings_analysis") or {},
             "detail": got.get("detail") or "",
         })
         self._absorb(bundle, got.get("factors") or [], "fund", "fund")
@@ -855,14 +1027,15 @@ class Predictor:
             out = out.get("factors") or []
         if isinstance(out, list):
             added = 0
-            for f in out:
-                if f is None:
-                    continue
-                if hasattr(f, "direction") and hasattr(f, "strength"):
-                    bundle.factors.append(f)
-                    added += 1
-            if added:
-                self.sources[category] = "%s×%d" % (modname, added)
+            with self._lock:                 # 并行写入保护
+                for f in out:
+                    if f is None:
+                        continue
+                    if hasattr(f, "direction") and hasattr(f, "strength"):
+                        bundle.factors.append(f)
+                        added += 1
+                if added:
+                    self.sources[category] = "%s×%d" % (modname, added)
         if isinstance(rich, dict):
             target = {
                 "stage": bundle.stage, "valuation": bundle.valuation,
@@ -936,10 +1109,10 @@ class Predictor:
                 bundle.error("自我学习", exc)
 
         _p("八大维度分析", 0.20)
-        self.analyze(bundle)
-        _p("因子汇总与概率推导", 0.72)
+        self.analyze(bundle, progress=progress)
+        _p("因子汇总与概率推导", 0.96)
         result = build_prediction(bundle, use_ml=self.use_ml, horizons=self.horizons,
-                                  progress=lambda m, p: _p(m, 0.72 + 0.25 * p))
+                                  progress=lambda m, p: _p(m, 0.96 + 0.03 * p))
         result.meta["sources"] = dict(self.sources)
         result.meta["demo"] = bool(self.demo or self.sources.get("daily", "").startswith("synthetic"))
         result.meta["errors"] = list(bundle.errors)
@@ -954,8 +1127,184 @@ class Predictor:
                 result.meta["recorded"] = _learn.record_prediction(result)
             except Exception as exc:  # noqa: BLE001
                 log.debug("写入预测档案失败: %s", exc)
-        _p("生成报告", 0.98)
+        _p("生成报告", 0.995)
         return result
+
+
+
+# --------------------------------------------------------------------------- #
+# 只分析大盘 / 板块（不需要个股代码）
+# --------------------------------------------------------------------------- #
+def analyze_market_scope(scope: str = "all", *, days: int = 800,
+                         verbose: bool = False) -> dict:
+    """不依赖个股，单独完成大盘与板块分析。
+
+    Parameters
+    ----------
+    scope : ``"market"``（仅大盘）｜``"board"``（大盘+板块）｜``"all"``（同 board）
+    days : 指数历史天数
+
+    Returns
+    -------
+    dict：``{"market","factors","detail","scope"}``
+        ``market`` 的键与 :class:`AnalysisBundle.market` 一致
+        （snapshot / structure / rotation / board_overview / detail）
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from . import global_market as GM
+
+    out: dict = {"market": {}, "factors": [], "detail": "", "scope": scope,
+                 "symbol": "", "name": "", "as_of": ""}
+    want_board = scope in ("board", "all")
+    market: dict = {}
+    frames: dict = {}
+
+    # ---- 并发取主要指数历史 ----
+    keys = ["sh", "sz", "cyb", "hs300", "zz500", "kc50"]
+    try:
+        with ThreadPoolExecutor(max_workers=min(len(keys), 6)) as pool:
+            futs = {pool.submit(GM.fetch_index_history, k, days): k for k in keys}
+            for fu in as_completed(futs):
+                k = futs[fu]
+                try:
+                    df = fu.result()
+                    if df is not None and len(df):
+                        frames[k] = df
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("指数 %s 取数失败: %s", k, exc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("指数并发取数失败: %s", exc)
+
+    if not frames:
+        out["detail"] = "未能取到任何指数数据，请检查网络或稍后重试"
+        return out
+
+    # ---- 实时指数行情 ----
+    try:
+        snap = GM.fetch_global_snapshot()
+        if snap:
+            snap = GM.enrich_snapshot_with_history(snap, frames)
+        market["snapshot"] = snap or {}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("指数快照失败: %s", exc)
+        market["snapshot"] = {}
+
+    # ---- 大盘三层结构（以上证指数为主）----
+    try:
+        from . import market_structure as MS
+
+        # 注意：不能写 frames.get("sh") or ... —— DataFrame 的 or 会抛
+        # "truth value of a DataFrame is ambiguous"（pandas 经典陷阱）
+        sh = frames.get("sh")
+        if sh is None or not len(sh):
+            sh = next((v for v in frames.values() if v is not None and len(v)), None)
+        if sh is None:
+            raise RuntimeError("没有可用的指数数据")
+        struct = MS.analyze_market_structure(sh, name="上证指数") or {}
+        market["structure"] = {
+            "regime": struct.get("regime") or {},
+            "phase": struct.get("phase") or {},
+            "swing": struct.get("swing") or {},
+            "volume_price": struct.get("volume_price") or {},
+            "levels": struct.get("levels") or {},
+            "discipline": struct.get("discipline") or {},
+            "traits": struct.get("traits") or [],
+            "vp_rules": struct.get("vp_rules") or [],
+            "detail": struct.get("detail") or "",
+            # 深度阶段判定（道氏+波浪+四维评分）
+            "deep": struct.get("deep") or {},
+            "deep_detail": struct.get("deep_detail") or "",
+        }
+        out["factors"].extend(struct.get("factors") or [])
+        out["as_of"] = str(sh["date"].iloc[-1])[:10] if "date" in sh.columns else ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("大盘结构分析失败: %s", exc)
+        market["structure"] = {}
+
+    # ---- 板块轮动 ----
+    if want_board:
+        try:
+            from . import market_board as MB
+
+            phase_key = ((market.get("structure") or {}).get("phase") or {}).get("phase") or ""
+            top = MB.analyze_topdown(frames, days=min(days, 500),
+                                     phase=phase_key, with_boards=True) or {}
+            market["board_overview"] = top.get("overview") or {}
+            market["rotation"] = top.get("rotation") or {}
+            market["topdown_detail"] = top.get("detail") or ""
+            out["factors"].extend(top.get("factors") or [])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("板块轮动分析失败: %s", exc)
+            market["rotation"] = {}
+
+    # ---- 大盘多指数概览（供界面表格）----
+    try:
+        from . import market_board as MB
+
+        market["overview"] = MB.market_overview(frames, days)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("指数概览失败: %s", exc)
+
+    # ---- 散户入场热度（开户数的代理指标：开户数已停止公开发布）----
+    try:
+        rh = _mod("retail_heat")
+        if rh is not None and frames:
+            _key = "sh" if "sh" in frames else list(frames.keys())[0]
+            _m = (market.get("market_fundamental") or {}).get("margin") or {}
+            heat = _call(rh.retail_heat, frames[_key], _m) or {}
+            market["retail_heat"] = heat
+            out["factors"].extend(_call(rh.heat_factors, heat) or [])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("散户热度失败: %s", exc)
+
+    # ---- 宏观/政治/社会/政策环境 + 涨跌主要动能对象 ----
+    try:
+        mc = _mod("market_context")
+        if mc is not None:
+            env = _call(mc.macro_environment) or {}
+            market["macro_env"] = env
+            out["factors"].extend(_call(mc.environment_factors, env) or [])
+            rot_now = market.get("rotation") or {}
+            drv = _call(mc.driver_analysis, rot_now.get("items") or []) or {}
+            market["drivers"] = drv
+            out["factors"].extend(_call(mc.driver_factors, drv) or [])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("环境/动能分析失败: %s", exc)
+
+    # ---- 大盘基本面替代物（估值分位/两融/北向/开户数）----
+    try:
+        mfd = _mod("market_fundamental")
+        if mfd is not None:
+            market["market_fundamental"] = _call(mfd.analyze, "hs300") or {}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("大盘基本面替代物失败: %s", exc)
+
+    # ---- 指数与板块的概率预测（新增）----
+    try:
+        mf = _mod("market_forecast")
+        if mf is not None:
+            fc = _call(mf.analyze, frames, with_boards=want_board) or {}
+            market["index_forecasts"] = fc.get("indices") or {}
+            market["board_forecasts"] = fc.get("boards") or []
+            market["forecast_detail"] = fc.get("detail") or ""
+            market["forecast_source"] = fc.get("source") or {}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("大盘/板块概率预测失败: %s", exc)
+
+    market["index_history"] = {k: v.tail(120) for k, v in frames.items()
+                               if hasattr(v, "tail")}
+    out["market"] = market
+
+    bits = []
+    st = market.get("structure") or {}
+    if st.get("detail"):
+        bits.append(st["detail"])
+    rot = market.get("rotation") or {}
+    if rot.get("detail"):
+        bits.append(rot["detail"])
+    out["detail"] = "；".join(bits) or "大盘/板块分析完成"
+    return out
 
 
 def build_prediction(bundle: AnalysisBundle, *, use_ml: bool = True,

@@ -104,6 +104,8 @@ def aggregate_factors(factors, horizon_key: str) -> Aggregated:
     """
     spec = horizon_spec(horizon_key)
     agg = Aggregated(horizon=horizon_key)
+    # 类内因子计数：用于同类因子递减权重（防同一信息被重复计权）
+    cat_seen: dict = {}
 
     for f in factors or []:
         if not isinstance(f, Factor) or not f.is_actionable:
@@ -116,10 +118,28 @@ def aggregate_factors(factors, horizon_key: str) -> Aggregated:
             direction = -direction
         w = config.factor_weight(horizon_key, spec.kind, f.id, f.category)
         w *= f.weight_multiplier
+        # ---- 类内递减权重（防同一信息被重复计权）----
+        # 同类别第 n 条因子 × 1/√n（1.0 / 0.71 / 0.58…）。
+        # 宏观类曾有 8 条都含趋势位置信息、sentiment 类 3 条都反映板块热点、
+        # technical 类 3 条都描述波段形态，简单相加等于给同一证据加了多倍权重。
+        # 递减只压重复，不改方向。
+        _n = cat_seen.get(f.category, 0) + 1
+        cat_seen[f.category] = _n
+        if _n > 1:
+            w *= 1.0 / (float(_n) ** 0.5)
         if spec.kind == "long" and f.category == Category.FUND:
             w *= config.FORECAST.get("long_horizon_fundamental_boost", 1.0)
         rel = max(f.reliability, 0.05)
-        contribution = direction * f.strength * rel * w
+        # ---- 有效强度归一化（兜住"构造后被改写 strength"的因子）----
+        # Factor.__post_init__ 已做过封顶，但部分模块在构造后直接改写
+        # .strength，绕过了封顶（AI 核对图2：方向=中却强度 0.95）。
+        # 这里在聚合前再统一压一次，保证：中性≤0.25、非中性≤可信度+0.25。
+        _st = float(f.strength or 0.0)
+        if direction == 0:
+            _st = min(_st, 0.25)
+        else:
+            _st = min(_st, max(0.15, rel + 0.25))
+        contribution = direction * _st * rel * w
         agg.raw_score += contribution
         agg.weight_sum += rel * w
         agg.n_factors += 1
@@ -418,6 +438,24 @@ def forecast_one(agg: Aggregated, vol: dict, horizon_key: str,
         note_bits.append("该股处于高波动状态，方向判断已做衰减处理")
     if ml_pred is not None and not getattr(ml_pred, "usable", False):
         note_bits.append("AI 模型样本不足，本周期仅用规则模型")
+    # ---- 概率来源披露（AI 核对图5 第1条：q1=29% 缺因子支撑）----
+    # 概率由「规则因子分 → p_rule」与「AI 模型 → p_ml」加权融合得到。
+    # 若最终概率与 p_rule 偏离很大，说明主导权在 AI 模型或先验，
+    # 而不是因子——这点必须明说，否则用户会误以为因子支撑了该结论。
+    try:
+        _pr = float(p_rule)
+        _gap = abs(float(p_up) - _pr)
+        if _gap >= 0.06:
+            note_bits.append(
+                "本周期概率主要来自%s（因子分对应 %.0f%%，最终 %.0f%%）"
+                % (("AI 模型" if mix.get("AI模型", 0) >= 0.5 else "模型融合"),
+                   _pr * 100, float(p_up) * 100))
+        fc._p_rule_detail = {"p_rule": round(_pr, 4), "p_ml": (round(p_ml, 4)
+                              if p_ml is not None else None),
+                              "w_ml": round(float(mix.get("AI模型", 0.0)), 3),
+                              "prior": round(float(prior), 4)}
+    except Exception:  # noqa: BLE001
+        pass
     fc.note = "；".join(note_bits)
     return fc
 
@@ -536,6 +574,21 @@ def fast_rule_score_history(df: pd.DataFrame, horizon_key: str) -> np.ndarray:
 # =========================================================================== #
 # 六、主入口
 # =========================================================================== #
+# 概率区分度自检：距离 50% 不足 5 个百分点时，说明因子证据不足以
+# 支撑方向判断，此时应如实提示"接近随机"，而不是让用户误以为有把握。
+NEAR_RANDOM_BAND = 0.05
+
+
+def near_random(p_up: float) -> str:
+    """返回提示文本；概率距 50% 足够远时返回空串。"""
+    try:
+        gap = abs(float(p_up) - 0.5)
+    except Exception:  # noqa: BLE001
+        return ""
+    if gap < NEAR_RANDOM_BAND:
+        return ("证据不足，接近随机（距 50%% 仅 %.1f 个百分点）" % (gap * 100))
+    return ""
+
 def build_forecasts(bundle, *, ml_models: dict | None = None,
                     use_ml: bool = True, horizons=HORIZONS,
                     df_override: pd.DataFrame | None = None) -> PredictionResult:
@@ -635,8 +688,22 @@ def build_forecasts(bundle, *, ml_models: dict | None = None,
                 from .utils import logit as _logit, sigmoid as _sigmoid
 
                 lo, hi = config.FORECAST["prob_clip"]
-                z = _logit(fc.p_up) + float(adj.get("prob_adjust_logit") or 0.0)
+                # ---- 校准强度限幅（AI 核对图5 第1条）----
+                # 自我学习按该股历史核账记录调概率，但各周期样本量不同
+                # （实测 40~60 条），小样本校准会把概率推到因子完全
+                # 支撑不了的位置（如 q1=29% 而因子分只有 +0.03）。
+                # 规则：调整量按样本量打折，且单次不超过 ±8 个百分点等效 logit。
+                _n_s = int(adj.get("samples") or 0)
+                _raw = float(adj.get("prob_adjust_logit") or 0.0)
+                # 样本 < 200 时按 sqrt(n/200) 缩水，最低保留 25%
+                _shrink = max(0.25, min(1.0, (_n_s / 200.0) ** 0.5))
+                _adj = max(-0.35, min(0.35, _raw * _shrink))
+                z = _logit(fc.p_up) + _adj
                 fc.p_up = clamp(_sigmoid(z), lo, hi)
+                if abs(_raw - _adj) > 0.02:
+                    fc.note = ((fc.note + "；") if fc.note else "") + \
+                        ("校准强度已按样本量收缩（%d 条，系数 %.2f，"
+                         "原始调整 %.2f → 实际 %.2f）" % (_n_s, _shrink, _raw, _adj))
                 fc.p_down = 1 - fc.p_up
                 fc.confidence = clamp(fc.confidence *
                                       float(adj.get("confidence_mult") or 1.0), 0.03, 0.95)

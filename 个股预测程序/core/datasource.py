@@ -1296,6 +1296,13 @@ def fetch_kline(symbol, period: str = "daily", days: int | None = None,
 def fetch_daily(symbol, days: int | None = None, adjust: str = "qfq",
                 force: bool = False) -> pd.DataFrame:
     """日线（见 :func:`fetch_kline`；``volume`` 单位为股，``amount`` 单位为元）。"""
+    try:
+        from . import freshness as _FR
+
+        if df is not None and len(df) and "date" in df.columns:
+            _FR.validate("daily", df["date"].max())
+    except Exception:  # noqa: BLE001
+        pass
     return fetch_kline(symbol, period="daily", days=days, adjust=adjust, force=force)
 
 

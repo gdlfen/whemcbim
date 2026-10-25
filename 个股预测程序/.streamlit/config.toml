@@ -1,0 +1,25 @@
+[theme]
+base = "light"
+primaryColor = "#c62828"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7fa"
+textColor = "#212121"
+font = "sans serif"
+
+[server]
+# 移动端访问建议开启（本地开发保持默认即可）
+headless = true
+enableXsrfProtection = true
+maxUploadSize = 8
+enableStaticServing = false
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+fastReruns = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "full"
+showSidebarNavigation = false

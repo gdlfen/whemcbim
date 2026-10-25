@@ -113,7 +113,14 @@ def _mk_stub():
     st.button = _btn
     st.download_button = _btn
     st.checkbox = lambda *a, **k: k.get("value", False)
-    st.text_input = lambda *a, **k: k.get("value", "")
+    def _text_input(label=None, value="", key=None, **k):
+        # 贴近真实 Streamlit：有 session_state 时返回其值，否则用默认值
+        if key and key in st.session_state:
+            return st.session_state[key]
+        if key:
+            st.session_state[key] = value
+        return k.get("value", value)
+    st.text_input = _text_input
     st.text_area = lambda *a, **k: k.get("value", "")
     st.number_input = lambda *a, **k: k.get("value", 0)
     st.selectbox = lambda label, options, **k: (
