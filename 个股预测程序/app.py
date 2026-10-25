@@ -2133,19 +2133,20 @@ def render_ai_config() -> None:
 
 
 def render_macro_manual() -> None:
-    """侧边栏：手动输入宏观数据（自动源过期时的兜底）。"""
+    """侧边栏：宏观数据（打开即自动获取，查不到的才手动填）。"""
     try:
         from core import macro_source as MO
-
-        cur = MO.load_manual()
     except Exception:  # noqa: BLE001
         return
-    with st.sidebar.expander("手动输入宏观数据（可选）", expanded=False):
-        st.caption("自动源（东财/akshare）过期时，可在此填最新值。"
-                   "**日期必填**，新鲜度校验会据此判断是否可用于分析。")
-        import datetime as _dt
-
-        # 官方数据源直达（点击即打开网页查数）
+    _auto_n = 0
+    try:
+        auto = MO.autoload()          # 打开即预取（1 小时缓存）
+        _auto_n = len([1 for v in auto.values() if v.get("value") is not None])
+    except Exception:  # noqa: BLE001
+        auto = {}
+    cur = MO.load_manual()
+    label = "宏观数据（自动获取 %d/6）" % _auto_n
+    with st.sidebar.expander(label, expanded=False):
         st.markdown(
             "**官方数据源直达：**\n"
             "- CPI / PPI / PMI → "
@@ -2156,49 +2157,106 @@ def render_macro_manual() -> None:
             "[上交所统计月报 ↗]("
             "https://www.sse.com.cn/aboutus/publication/monthly/investor/)",
             unsafe_allow_html=False)
-        st.caption("**怎么查**：统计局→数据查询→月度数据；央行→货币政策→统计数据。"
-                   "统计局与央行一般次月中旬披露上月数据。\n"
-                   "**单位**：CPI/PPI 填累计同比（%，如 2.3）；PMI 填数值（如 50.1）；"
-                   "M2 填同比（%）；LPR 填当期值（%）；沪市新开户填万户。\n"
-                   "填「数值 + 日期」后保存，新鲜度校验会认可（月频 70 天内有效）。")
-        keys = [("cpi", "CPI累计同比%"), ("ppi", "PPI累计同比%"), ("pmi", "PMI"),
-                ("m2", "M2同比%"), ("lpr", "LPR%"),
-                ("sse_new_accounts", "沪市A股新开户(万户)")]
+        st.caption("**程序已自动获取的项无需填写**；只有标为「需手动填写 / 自动·已过期」的才需要手动补。"
+                   "\n**单位**：CPI/PPI 填累计同比（%）、PMI 填数值、M2 填同比（%）、"
+                   "LPR 填当期值（%）、沪市新开户填万户。")
+
+        # 刷新按钮
+        c0, c1 = st.columns([2, 3])
+        with c0:
+            if st.button("刷新自动数据", key="mm_reload", width="stretch"):
+                try:
+                    MO.autoload(force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                st.rerun()
+        with c1:
+            try:
+                st.caption(MO.autoload_meta().get("detail") or "")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 数据版本号：把自动取数时间拼进控件 key。
+        # Streamlit 的 text_input 一旦创建，session_state 就固定，
+        # 后到的自动值填不进去（本地曾长期显示手填的 CPI=100.73 / PPI=-9.9，
+        # 而自动值是 0.9 / 2.3）。换 key 即强制刷新显示，同版本内仍可编辑。
+        try:
+            _ver = str(int(float(MO.autoload_meta().get("at") or 0) // 60))
+        except Exception:  # noqa: BLE001
+            _ver = "0"
+
         newd = dict(cur)
-        for k, lab in keys:
+        for k, lab in MO.MACRO_LABELS.items():
+            a = auto.get(k) or {}
             old = cur.get(k) or {}
-            c1, c2 = st.columns([3, 2])
-            with c1:
-                v = st.text_input(lab, value=(str(old.get("value")) if old.get("value") is not None else ""),
-                                 key="mm_v_%s" % k)
-            with c2:
-                dd = st.text_input("日期", value=(old.get("date") or ""),
-                                   key="mm_d_%s" % k, placeholder="2026-09-01")
+            use_auto = (a.get("value") is not None and a.get("fresh"))
+            if use_auto:
+                eff_v, eff_d = a.get("value"), (a.get("date") or "")
+                tag = "[自动获取]"
+                src = (a.get("source") or "")
+                if a.get("age_days") is not None:
+                    src += "（%d 天前）" % int(a["age_days"])
+            elif old.get("value") is not None:
+                eff_v, eff_d = old.get("value"), (old.get("date") or "")
+                tag, src = "[手动已填]", "本机 data/macro_manual.json"
+            elif a.get("value") is not None:
+                eff_v, eff_d = a.get("value"), (a.get("date") or "")
+                tag, src = "[自动·已过期]", "超过新鲜度上限，建议手动更新"
+            else:
+                eff_v, eff_d = None, ""
+                tag = "[需手动填写]"
+                src = MO.MANUAL_HINT.get(k) or "自动源未取得"
+
+            ca, cb = st.columns([3, 2])
+            with ca:
+                _kv = "mm_v_%s_%s" % (k, _ver)
+                if _kv not in st.session_state:
+                    st.session_state[_kv] = ("" if eff_v is None else str(eff_v))
+                v = st.text_input(lab, key=_kv)
+            with cb:
+                _kd = "mm_d_%s_%s" % (k, _ver)
+                if _kd not in st.session_state:
+                    st.session_state[_kd] = eff_d
+                dd = st.text_input("日期", key=_kd, placeholder="2026-09-01")
+
+            note = "%s　%s" % (tag, src)
+            if use_auto and old.get("value") is not None:
+                try:
+                    _same = abs(float(old["value"]) - float(a["value"])) < 1e-9
+                except Exception:  # noqa: BLE001
+                    _same = False
+                if not _same:      # 值相同就不啰嗦
+                    note += ("　（本机手填的 %s 已被自动值 %s 替代）"
+                             % (old.get("value"), a.get("value")))
+            st.caption(note)
+
+            # 自动值不回写手动文件，避免机读数据被固化成人工数据
+            if use_auto:
+                newd.pop(k, None)
+                continue
             if str(v).strip() == "":
                 newd.pop(k, None)
             else:
                 try:
                     newd[k] = {"value": float(str(v).strip()),
-                               "date": str(dd).strip(),
-                               "note": "手动输入"}
+                               "date": str(dd).strip(), "note": "手动输入"}
                 except Exception:  # noqa: BLE001
                     st.warning("%s 的值不是数字，已忽略" % lab)
+
         b1, b2 = st.columns(2)
         with b1:
             if st.button("保存", key="mm_save", width="stretch"):
                 if MO.save_manual(newd):
-                    st.success("已保存到 %s" % MO.MANUAL_FILE)
+                    st.success("已保存")
                     st.rerun()
                 else:
                     st.error("保存失败（检查目录权限）")
         with b2:
-            if st.button("清空", key="mm_clear", width="stretch"):
+            if st.button("清空手动值", key="mm_clear", width="stretch"):
                 MO.save_manual({})
-                st.info("已清空手动数据")
+                st.info("已清空手动数据（自动值不受影响）")
                 st.rerun()
-        st.caption("保存位置：%s" % getattr(MO, "MANUAL_FILE", "—"))
-
-
+        st.caption("手动值位置：%s" % getattr(MO, "MANUAL_FILE", "—"))
 def render_freshness(in_sidebar: bool = False) -> None:
     """数据新鲜度健康面板（通用机制 core/freshness.py）。
 
@@ -3533,7 +3591,7 @@ def main() -> None:
         "</div>", unsafe_allow_html=True)
 
     # ================= 先选分析范围（初始界面即可见）================= #
-    st.markdown("#### ① 选择分析范围")
+    st.markdown("#### ①选择分析范围")
     # 三个范围：大盘与板块**合并**为一个（板块分析本来就需要大盘波段来定位阶段，
     # 拆成两个反而要跑两遍）。
     # 用 segmented_control：**直接点名称即选中**，不需要额外的「选择」按钮。
