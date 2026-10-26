@@ -2250,6 +2250,28 @@ def render_macro_manual() -> None:
                 except Exception:  # noqa: BLE001
                     st.warning("%s 的值不是数字，已忽略" % lab)
 
+        # ---- AI 检索最新宏观信息（只展示，不写模型）----
+        st.divider()
+        if st.button("AI 检索最新宏观信息（仅核对用）", key="mm_ai_news",
+                     width="stretch"):
+            try:
+                from core import ai_analyst as AI
+
+                with st.spinner("AI 检索中…（约 10~30 秒）"):
+                    st.session_state["mm_ai_news_res"] = AI.macro_news()
+            except Exception as exc:  # noqa: BLE001
+                st.error("AI 检索失败：%s" % str(exc)[:100])
+        _nr = st.session_state.get("mm_ai_news_res") or {}
+        if _nr:
+            if not _nr.get("ok"):
+                st.warning("AI 未返回结果：%s" % (_nr.get("error") or "未知"))
+            else:
+                st.success("AI 检索完成（%s）" % (_nr.get("model") or "—"))
+                st.markdown(_nr.get("text") or "")
+                st.caption(_nr.get("disclaimer") or "")
+                st.warning("⚠️ **该结果不参与任何计算**，也不会写入手动数据。"
+                           "如与上方自动值不一致，请以上方数值或官方网站为准。")
+
         b1, b2 = st.columns(2)
         with b1:
             if st.button("保存", key="mm_save", width="stretch"):
@@ -3838,13 +3860,14 @@ def _render_subject_scoped(payload: dict, symbol: str, opts: dict,
 
     with tabs[0]:
         render_forecast_table(payload)
+        # 只保留「基准说明」这一条不可替代的信息。
+        # 「大涨/大跌概率阈值」「置信度自动折扣」已在上方
+        # render_forecast_table 的说明里出现过，重复显示会让手机端滚动很长。
         st.caption(
             "**基准说明**：本表所有概率、期望幅度、区间，都是相对"
             "**本次分析时的收盘价（现价）** 计算——即"
             "「到目标日为止，相对现在涨了还是跌了」，"
-            "**不是**「相对目标日前一个交易日」。\n\n"
-            "**大涨/大跌概率**按各周期阈值计算（1天 ±3%、20天 ±12%、1年 ±50% 等）；"
-            "**置信度**已根据历史回测结果自动折扣。")
+            "**不是**「相对目标日前一个交易日」。")
     with tabs[1]:
         render_charts(payload)
     with tabs[2]:

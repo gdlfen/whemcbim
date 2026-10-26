@@ -95,7 +95,7 @@ def _build_stub():
                     CAP.append((name, x))
         return fn
 
-    for m in ("markdown", "caption", "write", "info", "success", "warning",
+    for m in ("markdown", "caption", "divider", "write", "info", "success", "warning",
               "error", "title", "header", "subheader", "code", "json", "text"):
         setattr(st, m, rec(m))
 

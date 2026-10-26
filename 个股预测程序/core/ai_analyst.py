@@ -833,3 +833,71 @@ if __name__ == "__main__":  # pragma: no cover
     print("  同一 payload 摘要一致 ✓")
 
     print("\nai_analyst self-test OK")
+
+
+# --------------------------------------------------------------------------- #
+# 四、AI 检索权威最新宏观信息（**仅供人工核对，绝不进入模型**）
+# --------------------------------------------------------------------------- #
+MACRO_NEWS_PROMPT = """你是宏观数据核查助手。用户会给出他正在使用的宏观指标清单。
+请基于你的训练知识，给出这些指标**最新一次公开发布的数值**，并严格标注来源与时间。
+
+硬性要求：
+1. **每条必须给出三项**：指标名｜数值｜口径（同比/环比/累计/当月）｜
+   发布机构｜数据月份｜你知识里的发布时间。
+2. **不确定就写「不确定」**，绝对不要编造数值。
+3. 如果你的知识截止时间早于用户当前时间，必须明确写出
+   「我的知识可能已过期，请以官方网站为准」。
+4. 额外给出 3~5 条**近期宏观/政策事件**（会议、降准降息、重要文件），
+   每条注明大致时间；同样不确定就说明不确定。
+5. 不要给投资建议，不要预测行情。
+
+输出格式：
+### 一、指标最新值（含来源与时间）
+| 指标 | 数值 | 口径 | 发布机构 | 数据月份 |
+### 二、近期宏观与政策事件
+### 三、可靠性与时效声明
+
+中文，600 字内。"""
+
+
+def macro_news(*, use_cache: bool = True) -> dict:
+    """让 AI 检索最新宏观信息。**结果只展示，不写入任何模型数据。**
+
+    与 `suggest()` 的区别：suggest 针对单个缺失指标，本函数面向
+    当前程序已在用的 6 个宏观项，一次性给出"官方最新值 + 来源 + 时间"，
+    供人工核对界面上的自动抓取值是否一致。
+    """
+    if not available():
+        return {"ok": False, "text": "", "error": "未配置 API Key", "model": ""}
+    try:
+        from . import macro_source as MO
+
+        cur = MO.autoload()
+    except Exception:  # noqa: BLE001
+        cur = {}
+    rows = []
+    labels = {}
+    try:
+        labels = MO.MACRO_LABELS
+    except Exception:  # noqa: BLE001
+        labels = {}
+    for k, lab in (labels or {}).items():
+        v = (cur or {}).get(k) or {}
+        rows.append("%s：程序自动值 %s（%s，来源 %s）" % (
+            lab, v.get("value") if v.get("value") is not None else "未取到",
+            v.get("date") or "无日期", v.get("source") or "无"))
+    user = ("程序当前使用的宏观指标如下，请核对并给出官方最新值：\n"
+            + "\n".join(rows))
+    key = hash(("macro_news", user))
+    with _LOCK:
+        got = _CACHE.get(key)
+        if use_cache and got and (time.time() - got[0]) < _CACHE_TTL:
+            return {**got[1], "cached": True}
+    r = chat([{"role": "system", "content": MACRO_NEWS_PROMPT},
+              {"role": "user", "content": user}], max_tokens=1000)
+    r["disclaimer"] = ("AI 检索结果仅供人工核对，**不写入任何模型数据**。"
+                       "大模型对具体数值的记忆不可靠，请以官方页面为准。")
+    if r.get("ok"):
+        with _LOCK:
+            _CACHE[key] = (time.time(), r)
+    return r

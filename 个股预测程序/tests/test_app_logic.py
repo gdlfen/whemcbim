@@ -77,6 +77,8 @@ def _mk_stub():
     st = types.ModuleType("streamlit")
     st.session_state = _State()
     st.set_page_config = lambda **k: None
+    st.divider = lambda *a, **k: None
+    st.divider = lambda *a, **k: None
     st.markdown = lambda *a, **k: None
     st.caption = lambda *a, **k: None
     st.title = lambda *a, **k: None
