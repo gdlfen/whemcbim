@@ -2303,7 +2303,7 @@ def render_freshness(in_sidebar: bool = False) -> None:
         _show_df(pd.DataFrame(rows))
 
 
-def render_ai_review(p: dict) -> None:
+def render_ai_review(p: dict, key_prefix: str = "ai") -> None:
     """AI 复核：让大模型检查程序结论的矛盾与缺口。
 
     定位：AI 只做**文字复核**，不产生任何进入模型的数字。
@@ -2338,11 +2338,11 @@ def render_ai_review(p: dict) -> None:
     _opts = ["大盘"] + (["板块"] if _has_board else []) + \
             (["个股/基金"] if _has_subj else [])
     _tmap = {"大盘": "market", "板块": "board", "个股/基金": "subject"}
-    _cur = st.session_state.get("ai_target", _opts[0])
+    _cur = st.session_state.get("%s_target" % key_prefix, _opts[0])
     if _cur not in _opts:
         _cur = _opts[0]
     tgt_cn = st.radio("核对对象", _opts, index=_opts.index(_cur),
-                      horizontal=True, key="ai_target")
+                      horizontal=True, key=("%s_target" % key_prefix))
     target = _tmap.get(tgt_cn or "大盘", "market")
     if target == "market":
         st.caption("核对大盘：结论自洽性、四维评分矛盾、概率的可信度。")
@@ -2353,29 +2353,29 @@ def render_ai_review(p: dict) -> None:
         st.caption("核对个股/基金：八周期概率自洽性、因子重复计入、"
                    "置信度是否虚高、期望与区间是否匹配。")
     q = st.text_input("可选：向 AI 追问一个具体问题（仅①复核结论生效）",
-                      key="ai_q",
+                      key=("%s_q" % key_prefix),
                       placeholder="例如：四维评分里量价偏多但位置极弱，哪个更可信？")
     c1, c2, c3 = st.columns(3)
     with c1:
-        b1 = st.button("① 复核结论", key="ai_run1", width="stretch",
+        b1 = st.button("① 复核结论", key=("%s_run1" % key_prefix), width="stretch",
                        type="primary")
     with c2:
-        b2 = st.button("② 逐条评因子", key="ai_run2", width="stretch")
+        b2 = st.button("② 逐条评因子", key=("%s_run2" % key_prefix), width="stretch")
     with c3:
-        b3 = st.button("③ 历史类比", key="ai_run3", width="stretch")
+        b3 = st.button("③ 历史类比", key=("%s_run3" % key_prefix), width="stretch")
 
     if b1:
         with st.spinner("AI 复核中…（约 10~40 秒）"):
-            st.session_state["ai_result"] = AI.review_target(
+            st.session_state["%s_result" % key_prefix] = AI.review_target(
                 p, target, extra_question=q or "")
     if b2:
         with st.spinner("AI 逐条评价因子中…（约 15~50 秒，因子多时更久）"):
-            st.session_state["ai_result"] = AI.review_factors(p)
+            st.session_state["%s_result" % key_prefix] = AI.review_factors(p)
     if b3:
         with st.spinner("AI 检索历史相似时期中…（约 15~50 秒）"):
-            st.session_state["ai_result"] = AI.review_analog(p)
+            st.session_state["%s_result" % key_prefix] = AI.review_analog(p)
 
-    r = st.session_state.get("ai_result") or {}
+    r = st.session_state.get("%s_result" % key_prefix) or {}
     if not r:
         st.caption("点上方任一按钮开始。**底线**：AI 输出一律不进入概率模型，"
                    "只作人工对照参考。")
@@ -3855,7 +3855,7 @@ def _render_subject_scoped(payload: dict, symbol: str, opts: dict,
         render_backtest(payload, bool(opts["backtest"]), symbol, int(opts["days"]),
                         bool(opts["demo"]))
     with tabs[6]:
-        render_ai_review(payload)
+        render_ai_review(payload, key_prefix="subj")
 
     with tabs[5]:
         render_export(payload, symbol)

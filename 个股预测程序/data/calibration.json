@@ -1,18 +1,6 @@
 {
   "history": [
     {
-      "updated_at": "2026-10-25 15:08:52",
-      "total_samples": 439
-    },
-    {
-      "updated_at": "2026-10-25 15:11:34",
-      "total_samples": 439
-    },
-    {
-      "updated_at": "2026-10-25 15:14:07",
-      "total_samples": 439
-    },
-    {
       "updated_at": "2026-10-25 15:16:49",
       "total_samples": 439
     },
@@ -79,10 +67,22 @@
     {
       "updated_at": "2026-10-26 10:02:08",
       "total_samples": 439
+    },
+    {
+      "updated_at": "2026-10-26 10:58:43",
+      "total_samples": 439
+    },
+    {
+      "updated_at": "2026-10-26 10:59:59",
+      "total_samples": 439
+    },
+    {
+      "updated_at": "2026-10-26 11:01:15",
+      "total_samples": 439
     }
   ],
   "latest": {
-    "updated_at": "2026-10-26 10:02:08",
+    "updated_at": "2026-10-26 11:01:15",
     "total_samples": 439,
     "by_symbol": {
       "600519": {
