@@ -2285,7 +2285,28 @@ def render_macro_manual() -> None:
                            % (_nr.get("model") or "—",
                               _nr.get("news_count") or 0,
                               "、".join(_nr.get("news_sources") or []) or "—"))
-                st.markdown(_nr.get("text") or "")
+                # 把 AI 表格里「序号」列的纯数字替换成**可点击的原文链接**，
+                # 这样链接直接出现在事件表内，不需要另外翻折叠区。
+                # （AI 只填序号、程序拼 URL，避免模型编造链接。）
+                _txt = _nr.get("text") or ""
+                _its0 = _nr.get("news_items") or []
+                if _its0 and "序号" in _txt:
+                    _out = []
+                    for _ln in _txt.split("\n"):
+                        _c = _ln.strip()
+                        if _c.startswith("|") and _c.count("|") >= 4:
+                            _cell = [x.strip() for x in _c.strip("|").split("|")]
+                            _n0 = _cell[0] if _cell else ""
+                            if _n0.isdigit():
+                                _idx = int(_n0)
+                                if 1 <= _idx <= len(_its0):
+                                    _u = _its0[_idx - 1].get("url") or ""
+                                    if _u:
+                                        _cell[0] = "[%d](%s)" % (_idx, _u)
+                                        _ln = "| " + " | ".join(_cell) + " |"
+                        _out.append(_ln)
+                    _txt = "\n".join(_out)
+                st.markdown(_txt)
                 # 原文链接列表：AI 不会输出 URL，这里直接给抓到的原始清单
                 _its = _nr.get("news_items") or []
                 if _its:

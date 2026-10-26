@@ -676,9 +676,13 @@ def summarize_factors(payload: dict, top_n: int = 40) -> str:
         rel = _pick(f, "reliability")
         hz = _pick(f, "horizon")
         if isinstance(hz, (list, tuple)):
-            hz = ",".join(str(x) for x in hz[:3])
+            hz = ",".join(str(x) for x in hz[:3]) if hz else ""
         elif isinstance(hz, str):
             hz = hz.replace("/", ",")[:16]
+        # 周期为空时不要留"—"（AI 会据此质疑"周期标注缺失，无法判断单日/
+        # 波段/中期错配"）。空表示该因子对所有周期生效，明确写出来。
+        if not hz:
+            hz = "全部周期"
         _v = _pick(f, "value")
         if isinstance(_v, dict):
             # 值本身是 dict 时压成 "k=v" 形式，避免素材里出现原始字典
@@ -964,8 +968,12 @@ EVENT_PROMPT = """你是A股资讯筛选助手。用户会给你**两份材料**
 
 输出格式：
 ### 一、与当前范围相关的最新事件
-| 事件 | 简要内容 | 时间 | 来源 | 影响方向 |
+| 序号 | 事件 | 简要内容 | 时间 | 来源 | 影响方向 |
 ### 二、需要人工核实的地方
+
+**「序号」列**：必须填材料 A 里该条新闻前面的数字编号（如 12），
+用于程序自动附上原文链接；**绝对不要自己写 URL**。
+若无法确定序号，填「-」。
 
 **「简要内容」的写法**：只能用材料 A 里给出的摘要改写（1~2 句、不超过 60 字），
 说清发生了什么、涉及谁、关键数字。**若该条没有摘要，就写「仅有标题」**，
@@ -1009,9 +1017,12 @@ def latest_events(scope: str = "market", *, target: str = "",
     except Exception as exc:  # noqa: BLE001
         log.debug("抓取实时新闻失败: %s", exc)
     lines = []
-    for it in (news.get("items") or [])[:60]:
+    for _i, it in enumerate((news.get("items") or [])[:60], 1):
         _b = str(it.get("brief") or "").strip()
-        lines.append("[%s] %s（%s）%s" % (
+        # 编号：AI 只需在表格里填序号，原文链接由程序按序号拼出来，
+        # 避免让模型输出 URL（它记不住、也会编造）。
+        lines.append("%d. [%s] %s（%s）%s" % (
+            _i,
             it.get("time") or "时间不详",
             it.get("title") or "",
             it.get("source") or "",
@@ -1044,7 +1055,7 @@ def latest_events(scope: str = "market", *, target: str = "",
                          "time": x.get("time") or "",
                          "source": x.get("source") or "",
                          "url": x.get("url") or ""}
-                        for x in (news.get("items") or [])[:40]]
+                        for x in (news.get("items") or [])[:60]]
     if r.get("ok"):
         with _LOCK:
             _CACHE[key] = (time.time(), r)
