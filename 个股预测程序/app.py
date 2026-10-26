@@ -2252,13 +2252,15 @@ def render_macro_manual() -> None:
 
         # ---- AI 检索最新宏观信息（只展示，不写模型）----
         st.divider()
-        if st.button("AI 检索最新宏观信息（仅核对用）", key="mm_ai_news",
+        if st.button("AI 检索最新事件/政策（仅参考）", key="mm_ai_news",
                      width="stretch"):
             try:
                 from core import ai_analyst as AI
 
+                _sc = st.session_state.get("scope_key", "market")
+                _sc = {"all": "market"}.get(_sc, _sc)
                 with st.spinner("AI 检索中…（约 10~30 秒）"):
-                    st.session_state["mm_ai_news_res"] = AI.macro_news()
+                    st.session_state["mm_ai_news_res"] = AI.latest_events(_sc)
             except Exception as exc:  # noqa: BLE001
                 st.error("AI 检索失败：%s" % str(exc)[:100])
         _nr = st.session_state.get("mm_ai_news_res") or {}
@@ -2270,7 +2272,7 @@ def render_macro_manual() -> None:
                 st.markdown(_nr.get("text") or "")
                 st.caption(_nr.get("disclaimer") or "")
                 st.warning("⚠️ **该结果不参与任何计算**，也不会写入手动数据。"
-                           "如与上方自动值不一致，请以上方数值或官方网站为准。")
+                           "事件时间与来源可能记错，请以官方网站为准。")
 
         b1, b2 = st.columns(2)
         with b1:
@@ -2377,7 +2379,7 @@ def render_ai_review(p: dict, key_prefix: str = "ai") -> None:
     q = st.text_input("可选：向 AI 追问一个具体问题（仅①复核结论生效）",
                       key=("%s_q" % key_prefix),
                       placeholder="例如：四维评分里量价偏多但位置极弱，哪个更可信？")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         b1 = st.button("① 复核结论", key=("%s_run1" % key_prefix), width="stretch",
                        type="primary")
@@ -2385,6 +2387,8 @@ def render_ai_review(p: dict, key_prefix: str = "ai") -> None:
         b2 = st.button("② 逐条评因子", key=("%s_run2" % key_prefix), width="stretch")
     with c3:
         b3 = st.button("③ 历史类比", key=("%s_run3" % key_prefix), width="stretch")
+    with c4:
+        b4 = st.button("④ 最新事件", key=("%s_run4" % key_prefix), width="stretch")
 
     if b1:
         with st.spinner("AI 复核中…（约 10~40 秒）"):
@@ -2396,6 +2400,14 @@ def render_ai_review(p: dict, key_prefix: str = "ai") -> None:
     if b3:
         with st.spinner("AI 检索历史相似时期中…（约 15~50 秒）"):
             st.session_state["%s_result" % key_prefix] = AI.review_analog(p)
+    if b4:
+        # 按当前核对对象检索「相关权威最新事件/政策」——只展示，不入模型
+        with st.spinner("AI 检索最新事件中…（约 10~40 秒）"):
+            st.session_state["%s_result" % key_prefix] = AI.latest_events(
+                target, target=str(p.get("name") or ""),
+                boards=[b.get("name") for b in (((p.get("market") or {})
+                                                  .get("rotation") or {})
+                                                 .get("top") or [])][:8])
 
     r = st.session_state.get("%s_result" % key_prefix) or {}
     if not r:

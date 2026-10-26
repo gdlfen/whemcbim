@@ -834,70 +834,90 @@ if __name__ == "__main__":  # pragma: no cover
 
     print("\nai_analyst self-test OK")
 
+# --------------------------------------------------------------------------- #
+# 四、AI 检索权威最新「事件/政策」信息（按当前分析范围，仅供人工参考）
+# --------------------------------------------------------------------------- #
+#: 各核对对象的检索焦点
+_EVENT_FOCUS = {
+    "market": ("大盘层面的宏观与政策事件：中央/政治局会议、两会与重要文件、"
+               "货币政策（降准降息/MLF/LPR）、财政与产业政策、"
+               "监管取向（IPO/减持/量化）、地缘与外部冲击（美联储/汇率/关税）"),
+    "board": ("行业与板块层面的政策与事件：产业扶持或限制政策、"
+              "补贴与税收优惠、产能治理与价格调控、"
+              "行业数据与景气拐点、重大订单或技术突破"),
+    "subject": ("个股与所属行业层面的事件：公司公告（业绩预告/重大合同/回购增持/"
+                "股权变动/诉讼）、行业政策、监管处罚、"
+                "上下游价格与供需变化"),
+}
 
-# --------------------------------------------------------------------------- #
-# 四、AI 检索权威最新宏观信息（**仅供人工核对，绝不进入模型**）
-# --------------------------------------------------------------------------- #
-MACRO_NEWS_PROMPT = """你是宏观数据核查助手。用户会给出他正在使用的宏观指标清单。
-请基于你的训练知识，给出这些指标**最新一次公开发布的数值**，并严格标注来源与时间。
+EVENT_PROMPT = """你是A股信息核查助手。用户会告诉你他正在分析的**范围与标的**，
+请检索你知识范围内**与该范围直接相关的、权威渠道发布的最新主要事件/政策信息**。
 
 硬性要求：
-1. **每条必须给出三项**：指标名｜数值｜口径（同比/环比/累计/当月）｜
-   发布机构｜数据月份｜你知识里的发布时间。
-2. **不确定就写「不确定」**，绝对不要编造数值。
-3. 如果你的知识截止时间早于用户当前时间，必须明确写出
-   「我的知识可能已过期，请以官方网站为准」。
-4. 额外给出 3~5 条**近期宏观/政策事件**（会议、降准降息、重要文件），
-   每条注明大致时间；同样不确定就说明不确定。
-5. 不要给投资建议，不要预测行情。
+1. 只给**事件**，不要给行情预测、不要给买卖建议、不要编造数值。
+2. 每条必须包含四项：**事件** ｜ **时间（年月，尽量精确）** ｜
+   **来源（机构或媒体名称，如 国务院/央行/证监会/统计局/新华社）** ｜
+   **对该范围的可能影响方向（利多/利空/中性，不量化）**。
+3. 与范围无关的宏观事件不要凑数；**宁少勿滥，最多 6 条**。
+4. 你不确定的事必须写「不确定」；无法确认时间就写「时间待核实」。
+5. 如果你的知识截止时间早于用户当前时间，必须在结尾明确写出
+   「我的知识可能已过期，请以官方网站最新发布为准」。
+6. 结尾单独一段「需要人工核实的地方」，列出你认为需要用户去官网
+   确认的条目。
 
 输出格式：
-### 一、指标最新值（含来源与时间）
-| 指标 | 数值 | 口径 | 发布机构 | 数据月份 |
-### 二、近期宏观与政策事件
-### 三、可靠性与时效声明
+### 一、与当前范围相关的最新事件（最多 6 条）
+| 事件 | 时间 | 来源 | 影响方向 |
+### 二、需要人工核实的地方
 
 中文，600 字内。"""
 
 
-def macro_news(*, use_cache: bool = True) -> dict:
-    """让 AI 检索最新宏观信息。**结果只展示，不写入任何模型数据。**
+def latest_events(scope: str = "market", *, target: str = "",
+                  boards: list | None = None, use_cache: bool = True) -> dict:
+    """检索与当前分析范围相关的权威最新事件（**只展示，不入模型**）。
 
-    与 `suggest()` 的区别：suggest 针对单个缺失指标，本函数面向
-    当前程序已在用的 6 个宏观项，一次性给出"官方最新值 + 来源 + 时间"，
-    供人工核对界面上的自动抓取值是否一致。
+    Parameters
+    ----------
+    scope : ``market`` / ``board`` / ``subject``
+    target : 个股/基金名称（scope=subject 时用）
+    boards : 当前领涨板块名（scope=board 时用，作为行业线索）
     """
     if not available():
         return {"ok": False, "text": "", "error": "未配置 API Key", "model": ""}
+    focus = _EVENT_FOCUS.get(scope) or _EVENT_FOCUS["market"]
+    ctx = ["分析范围：%s" % {"market": "大盘", "board": "板块",
+                            "subject": "个股/基金"}.get(scope, scope)]
+    if scope == "subject" and target:
+        ctx.append("标的：%s" % target)
+    if scope == "board" and boards:
+        ctx.append("当前领涨/关注板块：%s" % "、".join(str(b) for b in boards[:8]))
+    # 附带程序当前的状态判断，让 AI 知道"在什么背景下找事件"
     try:
-        from . import macro_source as MO
-
-        cur = MO.autoload()
+        from . import market_source as _MS  # 不存在则跳过
     except Exception:  # noqa: BLE001
-        cur = {}
-    rows = []
-    labels = {}
-    try:
-        labels = MO.MACRO_LABELS
-    except Exception:  # noqa: BLE001
-        labels = {}
-    for k, lab in (labels or {}).items():
-        v = (cur or {}).get(k) or {}
-        rows.append("%s：程序自动值 %s（%s，来源 %s）" % (
-            lab, v.get("value") if v.get("value") is not None else "未取到",
-            v.get("date") or "无日期", v.get("source") or "无"))
-    user = ("程序当前使用的宏观指标如下，请核对并给出官方最新值：\n"
-            + "\n".join(rows))
-    key = hash(("macro_news", user))
+        pass
+    user = ("请围绕下面的范围与关注点检索最新事件：\n"
+            + "\n".join(ctx)
+            + "\n\n关注点：%s\n" % focus
+            + "\n再次强调：只给事件与来源时间，不要预测价格，不要编造。")
+    key = hash(("events", scope, target, tuple(boards or ()), focus))
     with _LOCK:
         got = _CACHE.get(key)
         if use_cache and got and (time.time() - got[0]) < _CACHE_TTL:
             return {**got[1], "cached": True}
-    r = chat([{"role": "system", "content": MACRO_NEWS_PROMPT},
+    r = chat([{"role": "system", "content": EVENT_PROMPT},
               {"role": "user", "content": user}], max_tokens=1000)
-    r["disclaimer"] = ("AI 检索结果仅供人工核对，**不写入任何模型数据**。"
-                       "大模型对具体数值的记忆不可靠，请以官方页面为准。")
+    r["disclaimer"] = ("AI 检索结果仅供人工参考，**不写入任何模型数据**，"
+                       "也不参与概率计算。事件时间与来源可能记错，"
+                       "请以官方网站最新发布为准。")
+    r["scope"], r["target"] = scope, target
     if r.get("ok"):
         with _LOCK:
             _CACHE[key] = (time.time(), r)
     return r
+
+
+def macro_news(*, use_cache: bool = True) -> dict:
+    """兼容旧接口：等价于检索大盘层面的最新政策/宏观事件。"""
+    return latest_events("market", use_cache=use_cache)
