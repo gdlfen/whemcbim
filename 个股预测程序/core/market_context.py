@@ -95,7 +95,14 @@ def _last_num(df, prefer=("今值", "现值", "value", "最新值"),
         d = df.copy()
         dcol = next((c for c in d.columns if any(k in str(c) for k in date_keys)), None)
         if dcol is not None:
-            d[dcol] = pd.to_datetime(d[dcol], errors="coerce")
+            # 加 format 推断提示，避免云端 pandas 3.x 刷
+            # "Could not infer format ... falling back to dateutil" 警告
+            import warnings as _w
+
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                d[dcol] = pd.to_datetime(d[dcol], errors="coerce",
+                                         format="mixed")
             d = d.dropna(subset=[dcol]).sort_values(dcol)
         vcol = None
         for k in prefer:

@@ -442,7 +442,11 @@ def forecast_one(agg: Aggregated, vol: dict, horizon_key: str,
     if vol.get("regime") == "high":
         note_bits.append("该股处于高波动状态，方向判断已做衰减处理")
     if ml_pred is not None and not getattr(ml_pred, "usable", False):
-        note_bits.append("AI 模型样本不足，本周期仅用规则模型")
+        # 把子模型的**真实失败原因**带到界面上（原来只有笼统一句"样本不足"，
+        # 云端出现 numpy/pandas 版本不兼容时根本看不到原因）。
+        _mlnote = str(getattr(ml_pred, "note", "") or "").strip()
+        note_bits.append("AI 模型未启用，本周期仅用规则模型"
+                         + (("（原因：%s）" % _mlnote[:160]) if _mlnote else ""))
     # ---- 概率来源披露（AI 核对图5 第1条：q1=29% 缺因子支撑）----
     # 概率由「规则因子分 → p_rule」与「AI 模型 → p_ml」加权融合得到。
     # 若最终概率与 p_rule 偏离很大，说明主导权在 AI 模型或先验，
