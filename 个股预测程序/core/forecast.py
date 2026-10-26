@@ -112,6 +112,11 @@ def aggregate_factors(factors, horizon_key: str) -> Aggregated:
             continue
         if not f.applies_to(horizon_key):
             continue
+        # 剔除「空因子占位」：强度≈0 且可信度很低时，该因子不携带任何信息，
+        # 却仍会占用 n_factors 与 weight_sum，稀释真实信号的权重
+        # （AI 核对指出「散户情绪/股吧/搜索热度 强0.00 信0.15-0.20 却保留」）。
+        if abs(float(f.strength or 0.0)) <= 0.001 and float(f.reliability or 0) < 0.20:
+            continue
         # 反向指标：登记在案的因子需要翻转方向（散户情绪等）
         direction = f.direction
         if f.id in config.CONTRARIAN_FACTOR_IDS:

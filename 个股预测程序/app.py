@@ -1677,8 +1677,15 @@ def render_header(p: dict) -> None:
     srcs = p.get("meta_sources") or {}
     if srcs:
         tags.append("<span class='tag'>%d 个分析模块</span>" % len(srcs))
-    tags.append("<span class='tag'>%d 条因子</span>" % p.get("n_factors", 0))
-    tags.append("<span class='tag'>耗时 %.0fs</span>" % p.get("elapsed", 0))
+    # 大盘/板块范围没有"因子/耗时"这两个概念（因子是个股八维的产物），
+    # 之前一律渲染成「0 条因子 / 耗时 0s」，手机端看着像程序没跑。
+    # 这里只在有值时才显示。
+    _nf = p.get("n_factors") or 0
+    _el = p.get("elapsed") or 0
+    if _nf > 0:
+        tags.append("<span class='tag'>%d 条因子</span>" % _nf)
+    if _el > 0:
+        tags.append("<span class='tag'>耗时 %.0fs</span>" % _el)
     if (p.get("meta_errors") or []):
         tags.append("<span class='tag warn'>%d 个模块未完成</span>"
                     % len(p["meta_errors"]))
@@ -3693,9 +3700,12 @@ def main() -> None:
     # 注意：进度容器只是数字，不属于 Streamlit UI，写进线程是合法的；
     # 缓存函数保持纯粹（不含任何 UI 调用）。
     if scope == "market":
-        _tip = "正在分析大盘与板块…（首次约 15~40 秒，含板块历史）"
+        _tip = ("正在分析大盘与板块…（**首次约 3~4 分钟**：需抓取 90 个板块的"
+                "当日快照与历史K线、指数与宏观数据；之后有缓存会快很多）")
     else:
-        _tip = "正在分析 %s 的八大维度…（首次约 20~60 秒）" % (sym_raw or "该标的")
+        _tip = ("正在分析 %s 的八大维度…（**首次约 3~4 分钟**：需抓取日线、"
+                "财务、资金、消息、板块与宏观等；之后有缓存会快很多）"
+                % (sym_raw or "该标的"))
 
     def _job():
         """后台任务：只算，不碰 UI。"""
@@ -3824,7 +3834,7 @@ def _render_subject_scoped(payload: dict, symbol: str, opts: dict,
     # 页签标题用纯中文：:material/... 图标标记只在部分 Streamlit 版本
     # 于标签串中生效，一旦不支持就会显示成字面量英文，不如直接不用。
     tabs = st.tabs(["预测总览", "图表", "因子与逻辑", "八维明细",
-                    "历史验证", "导出/工具"])
+                    "历史验证", "导出/工具", "AI 核对"])
 
     with tabs[0]:
         render_forecast_table(payload)
@@ -3844,6 +3854,9 @@ def _render_subject_scoped(payload: dict, symbol: str, opts: dict,
     with tabs[4]:
         render_backtest(payload, bool(opts["backtest"]), symbol, int(opts["days"]),
                         bool(opts["demo"]))
+    with tabs[6]:
+        render_ai_review(payload)
+
     with tabs[5]:
         render_export(payload, symbol)
         st.markdown("---")
