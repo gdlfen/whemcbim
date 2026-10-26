@@ -2135,7 +2135,12 @@ def render_ai_config() -> None:
                 AI.save_config(n2)
                 st.info("已清除本地 Key")
                 st.rerun()
-        st.caption("配置文件：%s" % (stt.get("config_file") or "—"))
+        try:
+            from core import ai_analyst as _AI2
+
+            st.caption("存储位置：%s" % _AI2.storage_note())
+        except Exception:  # noqa: BLE001
+            st.caption("配置文件：%s" % (stt.get("config_file") or "—"))
         st.caption("也可用环境变量 `STOCKAI_AI_KEY`（优先级高于界面配置）。")
 
 
@@ -2287,7 +2292,10 @@ def render_macro_manual() -> None:
                 MO.save_manual({})
                 st.info("已清空手动数据（自动值不受影响）")
                 st.rerun()
-        st.caption("手动值位置：%s" % getattr(MO, "MANUAL_FILE", "—"))
+        try:
+            st.caption("存储位置：%s" % MO.storage_note())
+        except Exception:  # noqa: BLE001
+            st.caption("手动值位置：%s" % getattr(MO, "MANUAL_FILE", "—"))
 def render_freshness(in_sidebar: bool = False) -> None:
     """数据新鲜度健康面板（通用机制 core/freshness.py）。
 

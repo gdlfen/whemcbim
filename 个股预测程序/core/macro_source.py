@@ -103,29 +103,40 @@ _LOCK = threading.RLock()
 
 
 def load_manual() -> dict:
-    """读手动输入的宏观数据：``{key: {value, date, note}}``。"""
-    with _LOCK:
-        try:
-            if os.path.exists(MANUAL_FILE):
-                with open(MANUAL_FILE, encoding="utf-8") as fh:
-                    d = json.load(fh)
-                return d if isinstance(d, dict) else {}
-        except Exception as exc:  # noqa: BLE001
-            log.debug("读手动宏观失败: %s", exc)
-    return {}
+    """读手动宏观数据：``{key: {value, date, note}}``。
+
+    **只从当前设备读**：本地落盘 data/macro_manual.json；
+    云端部署不落盘，按浏览器会话隔离（见 core/local_store.py）。
+    """
+    try:
+        from . import local_store as LS
+
+        return LS.load("macro_manual.json")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("读手动宏观失败: %s", exc)
+        return {}
 
 
 def save_manual(data: dict) -> bool:
-    """保存手动输入的宏观数据。"""
-    with _LOCK:
-        try:
-            os.makedirs(os.path.dirname(MANUAL_FILE), exist_ok=True)
-            with open(MANUAL_FILE, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.warning("保存手动宏观失败: %s", exc)
-            return False
+    """保存手动宏观数据——**仅当前设备/会话可见**，不写入仓库。"""
+    try:
+        from . import local_store as LS
+
+        return LS.save("macro_manual.json", data)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("保存手动宏观失败: %s", exc)
+        return False
+
+
+def storage_note() -> str:
+    """界面用：手动宏观数据保存在哪里。"""
+    try:
+        from . import local_store as LS
+
+        return LS.describe("macro_manual.json")
+    except Exception:  # noqa: BLE001
+        return ""
+
 
 
 def _em_fetch(key: str) -> dict | None:

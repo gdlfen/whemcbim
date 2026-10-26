@@ -37,3 +37,6 @@ tests/.smoke_payloads.json
 
 # 含 API Key，禁止提交
 data/ai_config.json
+
+# 设备私有数据，禁止提交
+data/macro_manual.json

@@ -59,7 +59,7 @@ CORE_MODULES = [
     "charts", "report", "engine",
     # 新增维度模块
     "global_market", "main_force_intent", "commodity_industry", "fund",
-    "market_structure", "market_board", "progress", "v8_guard", "keypoint", "market_forecast", "market_fundamental", "market_phase", "market_context", "freshness", "macro_source", "retail_heat", "ai_analyst",
+    "market_structure", "market_board", "progress", "v8_guard", "keypoint", "market_forecast", "market_fundamental", "market_phase", "market_context", "freshness", "local_store", "macro_source", "retail_heat", "ai_analyst",
 ]
 # 允许缺失的模块（缺失时引擎会自动跳过该维度，只是功能减少）
 OPTIONAL_MODULES = {"datasource", "technical", "fundamental", "capital",

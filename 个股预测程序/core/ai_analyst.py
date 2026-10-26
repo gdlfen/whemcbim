@@ -74,34 +74,39 @@ CONFIG_FILE = os.environ.get("STOCKAI_AI_CONFIG") or os.path.join(
 
 
 def load_config() -> dict:
-    """读界面保存的 AI 配置（不含环境变量）。"""
-    with _LOCK:
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, encoding="utf-8") as fh:
-                    d = json.load(fh)
-                return d if isinstance(d, dict) else {}
-        except Exception as exc:  # noqa: BLE001
-            log.debug("读 AI 配置失败: %s", exc)
-    return {}
+    """读 AI 配置（不含环境变量）。
+
+    **只从当前设备读取**：本地落盘 data/ai_config.json；
+    云端部署不落盘，改为按浏览器会话隔离的内存存储（见 core/local_store.py）。
+    """
+    try:
+        from . import local_store as LS
+
+        return LS.load("ai_config.json")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("读 AI 配置失败: %s", exc)
+        return {}
 
 
 def save_config(cfg: dict) -> bool:
-    """保存 AI 配置到本地（**含 Key，文件已 gitignore**）。"""
-    with _LOCK:
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-                json.dump(cfg, fh, ensure_ascii=False, indent=2)
-            # 尽量收紧权限（Windows 上 chmod 作用有限，但无害）
-            try:
-                os.chmod(CONFIG_FILE, 0o600)
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.warning("保存 AI 配置失败: %s", exc)
-            return False
+    """保存 AI 配置（含 Key）——**仅当前设备/会话可见**，绝不写入仓库。"""
+    try:
+        from . import local_store as LS
+
+        return LS.save("ai_config.json", cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("保存 AI 配置失败: %s", exc)
+        return False
+
+
+def storage_note() -> str:
+    """界面用：AI 配置当前保存在哪里。"""
+    try:
+        from . import local_store as LS
+
+        return LS.describe("ai_config.json")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def mask_key(k: str) -> str:
@@ -730,10 +735,15 @@ if __name__ == "__main__":  # pragma: no cover
     # ---- 自测隔离配置 ----
     # 用户可能已在界面配置了真实 Key，直接跑会真的发起网络请求、
     # 也会让"未配置时安全降级"的断言失效。这里切到临时路径 + 清环境变量。
-    _ORIG_FILE = CONFIG_FILE
+    # 配置读写已改由 core/local_store 负责，隔离也要改到那一层：
+    # 临时把 local_store.load 换成「永远空」、save 换成 no-op，
+    # 自测既读不到用户真实 Key，也不会写坏真实配置。
     _ORIG_ENV = os.environ.pop("STOCKAI_AI_KEY", None)
-    CONFIG_FILE = os.path.join(tempfile.mkdtemp(prefix="ai_selftest_"),
-                               "none.json")
+    import core.local_store as _LS
+
+    _ORIG_LOAD, _ORIG_SAVE = _LS.load, _LS.save
+    _LS.load = lambda name: {}
+    _LS.save = lambda name, data: True
 
     FAKE = {
         "name": "上证指数", "as_of": "2026-10-24", "price": 3690.47,
@@ -831,6 +841,11 @@ if __name__ == "__main__":  # pragma: no cover
     b = summarize_payload(FAKE)
     assert a == b
     print("  同一 payload 摘要一致 ✓")
+
+    # ---- 恢复真实配置（自测会临时替换 local_store 的读写）----
+    _LS.load, _LS.save = _ORIG_LOAD, _ORIG_SAVE
+    if _ORIG_ENV is not None:
+        os.environ["STOCKAI_AI_KEY"] = _ORIG_ENV
 
     print("\nai_analyst self-test OK")
 
