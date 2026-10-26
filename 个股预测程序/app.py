@@ -2281,8 +2281,23 @@ def render_macro_manual() -> None:
             if not _nr.get("ok"):
                 st.warning("AI 未返回结果：%s" % (_nr.get("error") or "未知"))
             else:
-                st.success("AI 检索完成（%s）" % (_nr.get("model") or "—"))
+                st.success("AI 检索完成（%s）｜基于 %s 条实时资讯（%s）"
+                           % (_nr.get("model") or "—",
+                              _nr.get("news_count") or 0,
+                              "、".join(_nr.get("news_sources") or []) or "—"))
                 st.markdown(_nr.get("text") or "")
+                # 原文链接列表：AI 不会输出 URL，这里直接给抓到的原始清单
+                _its = _nr.get("news_items") or []
+                if _its:
+                    with st.expander("查看抓取的原文列表（%d 条，可点击）" % len(_its)):
+                        _lines = []
+                        for _i, _x in enumerate(_its, 1):
+                            _t = (_x.get("title") or "")[:60]
+                            _u = _x.get("url") or ""
+                            _lines.append("%d. [%s](%s)　%s ｜ %s"
+                                          % (_i, _t, _u, _x.get("time") or "—",
+                                             _x.get("source") or ""))
+                        st.markdown("\n".join(_lines))
                 st.caption(_nr.get("disclaimer") or "")
                 st.warning("⚠️ **该结果不参与任何计算**，也不会写入手动数据。"
                            "事件时间与来源可能记错，请以官方网站为准。")

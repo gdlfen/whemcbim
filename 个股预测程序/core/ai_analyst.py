@@ -194,6 +194,74 @@ def chat(messages: list, *, temperature: float = 0.3,
 # --------------------------------------------------------------------------- #
 # 一、把程序结论压成一份"给 AI 看的事实清单"
 # --------------------------------------------------------------------------- #
+def _extra_facts(payload: dict) -> list:
+    """输出「程序其实有、但之前没喂给 AI」的关键事实。
+
+    覆盖 AI 反复质疑缺口的四项：
+      · 年线/MA60/现价的绝对数值与距离（量化"距闸门多远"）
+      · 两融余额与 5/20 日变化（判断杠杆资金流入还是撤离）
+      · 指数/标的概率预测（评估置信度的校准依据）
+      · 板块宽度与其口径（判断普涨还是结构性反抽）
+    """
+    out = []
+    if not isinstance(payload, dict):
+        return out
+    mk = payload.get("market") or {}
+    stt = mk.get("structure") or {}
+    lv = stt.get("levels") or {}
+    try:
+        cur = float(lv.get("current") or payload.get("price") or 0)
+        ma250 = float(lv.get("ma250") or 0)
+        ma60 = float(lv.get("ma60") or 0)
+        ma20 = float(lv.get("ma20") or 0)
+        if cur > 0:
+            seg = ["现价 %.2f" % cur]
+            for name, v in (("年线", ma250), ("季线MA60", ma60), ("月线MA20", ma20)):
+                if v > 0:
+                    seg.append("%s %.2f（现价%s %.2f%%）"
+                               % (name, v, "高于" if cur >= v else "低于",
+                                  (cur / v - 1) * 100))
+            if lv.get("year_high") and lv.get("year_low"):
+                seg.append("一年区间 %.2f~%.2f（位置 %.0f%%）"
+                           % (lv["year_high"], lv["year_low"],
+                              float(lv.get("range_position_pct") or 0)))
+            out.append("关键位置：" + "；".join(seg))
+    except Exception:  # noqa: BLE001
+        pass
+    mf = mk.get("market_fundamental") or {}
+    mg = mf.get("margin") or {}
+    if mg.get("balance") is not None:
+        out.append("两融：余额 %.0f 亿（%s），近5日 %s%%，近20日 %s%%"
+                   % (mg.get("balance") or 0, mg.get("date") or "—",
+                      ("%+.2f" % mg["change_5d_pct"])
+                      if mg.get("change_5d_pct") is not None else "—",
+                      ("%+.2f" % mg["change_20d_pct"])
+                      if mg.get("change_20d_pct") is not None else "—"))
+    nt = mf.get("north") or {}
+    if nt.get("sum_20d") is not None:
+        out.append("北向：近20日 %+.1f 亿（20日中 %d 天净买）"
+                   % (nt["sum_20d"], nt.get("positive_days_20") or 0))
+    ifc = mk.get("index_forecasts") or {}
+    if ifc:
+        bits = []
+        for k, series in list(ifc.items())[:3]:
+            if not series:
+                continue
+            bits.append("%s d20=%.0f%% q1=%.0f%%（置信度%.0f%%）" % (
+                k,
+                next((x["p_up"] * 100 for x in series if x["horizon"] == "d20"), 0),
+                next((x["p_up"] * 100 for x in series if x["horizon"] == "q1"), 0),
+                (series[0].get("confidence") or 0) * 100))
+        if bits:
+            out.append("指数概率：" + "；".join(bits))
+    rot = mk.get("rotation") or {}
+    if rot.get("board_breadth_pct") is not None:
+        out.append("板块宽度 %.1f%%（口径：%s）"
+                   % (rot["board_breadth_pct"],
+                      rot.get("breadth_basis") or "未标注"))
+    return out
+
+
 def summarize_payload(payload: dict) -> str:
     """从分析 payload 里提取关键结论，压缩成紧凑文本（控制 token）。"""
     if not isinstance(payload, dict):
@@ -307,6 +375,10 @@ def summarize_payload(payload: dict) -> str:
         gaps.append("无指数概率预测")
     if not rot.get("board_count"):
         gaps.append("无板块数据")
+    _ex = _extra_facts(payload)
+    if _ex:
+        L.append("\n## 程序已具备的定量事实（以下均为程序实测值）")
+        L.extend(_ex)
     L.append("\n## 已知数据缺口")
     L.append("；".join(gaps) if gaps else "（主要指标齐全）")
     return "\n".join(L)
@@ -447,6 +519,11 @@ def summarize_subject(payload: dict, top_factors: int = 30) -> str:
                      % (stg["label"], (stg.get("confidence") or 0) * 100))
         if stg.get("consistency") is not None:
             L.append("八周期一致性：%.0f%%" % (stg["consistency"] * 100))
+    _ex2 = _extra_facts(payload)
+    if _ex2:
+        L.append("\n## 大盘与资金侧事实")
+        L.extend(_ex2)
+
     # 基金专属
     fd = payload.get("fund") or {}
     if fd:
@@ -865,27 +942,36 @@ _EVENT_FOCUS = {
                 "上下游价格与供需变化"),
 }
 
-EVENT_PROMPT = """你是A股信息核查助手。用户会告诉你他正在分析的**范围与标的**，
-请检索你知识范围内**与该范围直接相关的、权威渠道发布的最新主要事件/政策信息**。
+EVENT_PROMPT = """你是A股资讯筛选助手。用户会给你**两份材料**：
+（A）程序刚从财经网站抓取的**实时新闻标题列表**（含时间与来源）；
+（B）他当前的分析范围与关注点。
 
-硬性要求：
-1. 只给**事件**，不要给行情预测、不要给买卖建议、不要编造数值。
-2. 每条必须包含四项：**事件** ｜ **时间（年月，尽量精确）** ｜
-   **来源（机构或媒体名称，如 国务院/央行/证监会/统计局/新华社）** ｜
-   **对该范围的可能影响方向（利多/利空/中性，不量化）**。
-3. 与范围无关的宏观事件不要凑数；**宁少勿滥，最多 6 条**。
-4. 你不确定的事必须写「不确定」；无法确认时间就写「时间待核实」。
-5. 如果你的知识截止时间早于用户当前时间，必须在结尾明确写出
-   「我的知识可能已过期，请以官方网站最新发布为准」。
-6. 结尾单独一段「需要人工核实的地方」，列出你认为需要用户去官网
-   确认的条目。
+你的任务：**只从列表 A 里挑选**与关注点相关的条目，整理成事件表。
+
+绝对禁止：
+· 不要使用你自己的记忆补充事件（你的知识可能停在两年前，那样会给出过时信息）
+· 不要编造列表里没有的事件、时间或来源
+· 不要预测价格、不要给买卖建议
+
+要求：
+1. 每条包含：**事件（改写标题为一句通顺的话）** ｜ **时间（取自列表）** ｜
+   **来源（取自列表）** ｜ **对该范围的可能影响方向（利多/利空/中性）**
+2. 与关注点无关的条目直接略过；**最多 8 条**
+3. 若列表 A 里**没有任何**与关注点相关的条目，必须直接回答
+   「本次抓取的资讯中没有与该范围直接相关的事件」，不要另找内容填充
+4. 结尾单独一段「需要人工核实的地方」，说明哪些条目因标题信息不足
+   需要点开原文确认。
 
 输出格式：
-### 一、与当前范围相关的最新事件（最多 6 条）
-| 事件 | 时间 | 来源 | 影响方向 |
+### 一、与当前范围相关的最新事件
+| 事件 | 简要内容 | 时间 | 来源 | 影响方向 |
 ### 二、需要人工核实的地方
 
-中文，600 字内。"""
+**「简要内容」的写法**：只能用材料 A 里给出的摘要改写（1~2 句、不超过 60 字），
+说清发生了什么、涉及谁、关键数字。**若该条没有摘要，就写「仅有标题」**，
+绝不能用你的记忆补充细节。
+
+中文，800 字内。"""
 
 
 def latest_events(scope: str = "market", *, target: str = "",
@@ -912,11 +998,34 @@ def latest_events(scope: str = "market", *, target: str = "",
         from . import market_source as _MS  # 不存在则跳过
     except Exception:  # noqa: BLE001
         pass
-    user = ("请围绕下面的范围与关注点检索最新事件：\n"
+    # ---- 先抓真实新闻，再让 AI 只做筛选 ----
+    # 这一层是关键：模型记忆可能停在两年前，直接问它会返回旧事件；
+    # 把「今天抓到的标题」给它，它只能基于新数据做筛选与改写。
+    news = {"items": [], "sources": [], "detail": ""}
+    try:
+        from . import news_feed as NF
+
+        news = NF.fetch_headlines(60)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("抓取实时新闻失败: %s", exc)
+    lines = []
+    for it in (news.get("items") or [])[:60]:
+        _b = str(it.get("brief") or "").strip()
+        lines.append("[%s] %s（%s）%s" % (
+            it.get("time") or "时间不详",
+            it.get("title") or "",
+            it.get("source") or "",
+            ("\n    摘要：" + _b) if _b else "\n    摘要：无"))
+    feed_txt = ("\n".join(lines) if lines
+                else "（本次未能抓取到实时资讯，请告知用户稍后重试，不要用记忆补充）")
+    user = ("（A）程序刚抓取的实时新闻标题列表：\n"
+            + feed_txt
+            + "\n\n（B）分析范围与关注点：\n"
             + "\n".join(ctx)
-            + "\n\n关注点：%s\n" % focus
-            + "\n再次强调：只给事件与来源时间，不要预测价格，不要编造。")
-    key = hash(("events", scope, target, tuple(boards or ()), focus))
+            + "\n关注点：%s\n" % focus
+            + "\n再次强调：只从列表 A 中挑选，不要用记忆补充，不要编造。")
+    key = hash(("events", scope, target, tuple(boards or ()), focus,
+                tuple(x.get("title", "")[:24] for x in (news.get("items") or [])[:8])))
     with _LOCK:
         got = _CACHE.get(key)
         if use_cache and got and (time.time() - got[0]) < _CACHE_TTL:
@@ -927,6 +1036,15 @@ def latest_events(scope: str = "market", *, target: str = "",
                        "也不参与概率计算。事件时间与来源可能记错，"
                        "请以官方网站最新发布为准。")
     r["scope"], r["target"] = scope, target
+    r["news_count"] = len(news.get("items") or [])
+    r["news_sources"] = news.get("sources") or []
+    r["news_detail"] = news.get("detail") or ""
+    # 原始清单（含原文链接）——AI 不输出 URL，由界面直接渲染成可点击列表
+    r["news_items"] = [{"title": x.get("title") or "",
+                         "time": x.get("time") or "",
+                         "source": x.get("source") or "",
+                         "url": x.get("url") or ""}
+                        for x in (news.get("items") or [])[:40]]
     if r.get("ok"):
         with _LOCK:
             _CACHE[key] = (time.time(), r)
