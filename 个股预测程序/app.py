@@ -2137,8 +2137,16 @@ def render_ai_config() -> None:
                 st.rerun()
         try:
             from core import ai_analyst as _AI2
+            from core import local_store as _LS2
 
             st.caption("存储位置：%s" % _AI2.storage_note())
+            if not _LS2.is_local():
+                _allow = st.checkbox(
+                    "把 Key 存进浏览器地址栏（刷新后不用重填）",
+                    value=_LS2.allow_key_in_url(), key="ai_key_in_url",
+                    help="开启后 Key 会编码进 URL：刷新不失效、只属于你，"
+                         "但地址栏可见，请勿分享该链接。关闭则仅存当前会话内存。")
+                _LS2.set_allow_key_in_url(bool(_allow))
         except Exception:  # noqa: BLE001
             st.caption("配置文件：%s" % (stt.get("config_file") or "—"))
         st.caption("也可用环境变量 `STOCKAI_AI_KEY`（优先级高于界面配置）。")
@@ -3638,6 +3646,15 @@ def main() -> None:
         "的涨跌概率与幅度推断</div>"
         "<div class='byline'>田夫 开发</div>"
         "</div>", unsafe_allow_html=True)
+
+    # 云端：把 URL 里的私有数据（AI 配置 / 手动宏观值）同步进进程缓存。
+    # 后台分析线程不能访问 st.query_params，只能读这份缓存，所以必须在这里刷。
+    try:
+        from core import local_store as _LS
+
+        _LS.sync_from_query()
+    except Exception:  # noqa: BLE001
+        pass
 
     # ================= 先选分析范围（初始界面即可见）================= #
     st.markdown("#### ①选择分析范围")
